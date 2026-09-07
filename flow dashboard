@@ -1,65 +1,145 @@
 """
-lineage_flow_visual.py
-------------------------
-Standalone interactive flow visual - launched as its own process by
-lineage_dashboard.py (same split as the original health_check.py /
-Sheet_Trace_Visual_6.py / sheet_tree_server.py architecture).
+lineage_dashboard.py
+----------------------
+Streamlit dashboard: classify every sheet - across one workpaper, or every
+workbook in an entity's folder - into a FIXED Input / Process / Output
+category taxonomy, then draw the real sheet-to-sheet formula flow with a
+hard rule enforced:
 
-Reads a small handoff JSON (file paths + confirmed stage/category per
-sheet), re-parses formulas itself, builds the sheet-to-sheet flow graph,
-and serves an interactive vis-network page:
+    Input   -> Input   or Process
+    Process -> Process or Output
 
-  - Nodes colored by stage (Input / Process / Output / Unclassified),
-    positioned in columns left -> right.
-  - Edges: gray = normal (follows Input->Input/Process, Process->
-    Process/Output), red dashed = ANOMALY (breaks that rule), purple
-    dashed = touches an unclassified sheet.
-  - Click a sheet box -> actually switches to that sheet in Excel via
-    pywin32 COM automation (same mechanism VBA macros use) and draws
-    Trace Precedents / Trace Dependents arrows on it.
-  - Search box, right-click to hide/show a node, a show/hide panel with
-    Show all / Hide all / Undo.
+Any real formula link that breaks this rule (Process -> Input, Output ->
+anything, a link touching a sheet nobody has classified yet, etc.) is drawn
+as a flagged ANOMALY edge instead of being hidden or silently allowed, and
+listed in its own table underneath the diagram.
 
 Requires:
-    pip install openpyxl pywin32
-    Excel must be installed for the click-to-open feature.
+    pip install streamlit openpyxl pandas
 
 Usage:
-    python lineage_flow_visual.py lineage_handoff.json
+    streamlit run lineage_dashboard.py
 """
 
+import concurrent.futures
 import json
 import os
 import re
+import subprocess
 import sys
-import threading
-import time
-import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
+import tempfile
+import urllib.parse
+import zipfile
+import xml.etree.ElementTree as ET
 
-from openpyxl import load_workbook, Workbook
-from openpyxl.styles import Font
+import pandas as pd
+import streamlit as st
+from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter, column_index_from_string
 
-DEFAULT_MIN_CELLS = 1
-PORT = 0  # 0 = let the OS pick a free port
+# =================================================================
+# 1. FIXED CATEGORY TAXONOMY - edit this block to change categories.
+#    Every category belongs to exactly one stage. Pick a category in
+#    the UI and the stage comes along with it automatically.
+# =================================================================
+
+CATEGORY_TAXONOMY = {
+    "Input": [
+        "SAP/BW Reports", "S4 GR", "ERS", "SAC Reports", "TDRTs", "KAS",
+        "TMN02", "Non TMN02", "List of Elections", "Legal Entity Info",
+        "Tax Law", "Tax Regulation",
+    ],
+    "Process": [
+        "Excel Workpapers", "Corptax", "Longview", "UTA", "DTTU", "SODA",
+        "TARS", "BNA/SAP Tangibles", "BNA Workpapers", "PTMS",
+    ],
+    "Output": [
+        "Annual Federal Tax Returns", "Multi-State Tax Returns",
+        "Property Tax Returns/Payments", "Federal/State Audit Requirements",
+        "Quarterly Estimated Filings", "Extension Filings", "Tax Payments",
+        "Tax Provision", "Group Reporting Requirements", "Dep Notices",
+        "Tax Advisory",
+    ],
+}
 
 UNCLASSIFIED = "(Unclassified)"
-ALLOWED_STAGE_TRANSITIONS = {
-    ("Input", "Input"), ("Input", "Process"),
-    ("Process", "Process"), ("Process", "Output"),
+CATEGORY_TO_STAGE = {c: stage for stage, cats in CATEGORY_TAXONOMY.items() for c in cats}
+ALL_CATEGORIES = [UNCLASSIFIED] + [c for cats in CATEGORY_TAXONOMY.values() for c in cats]
+
+# Lowercase substring keyword hints used to PRE-FILL a guess per sheet name.
+# You always review/override these before confirming - add more as you
+# learn the naming conventions in your own workbooks.
+CATEGORY_KEYWORDS = {
+    "SAP/BW Reports": ["sap", "bw report"],
+    "S4 GR": ["s4", "s/4", " gr"],
+    "ERS": ["ers"],
+    "SAC Reports": ["sac"],
+    "TDRTs": ["tdrt"],
+    "KAS": ["kas"],
+    "TMN02": ["tmn02", "tmn 02"],
+    "Non TMN02": ["non tmn", "non-tmn"],
+    "List of Elections": ["election"],
+    "Legal Entity Info": ["legal entity", "entity info", "entity list"],
+    "Tax Law": ["tax law"],
+    "Tax Regulation": ["regulation", "reg update"],
+    "Excel Workpapers": ["workpaper", " wp"],
+    "Corptax": ["corptax"],
+    "Longview": ["longview", "lv "],
+    "UTA": ["uta"],
+    "DTTU": ["dttu"],
+    "SODA": ["soda"],
+    "TARS": ["tars"],
+    "BNA/SAP Tangibles": ["tangible", "bna sap"],
+    "BNA Workpapers": ["bna"],
+    "PTMS": ["ptms"],
+    "Annual Federal Tax Returns": ["federal return", "1120", "annual federal"],
+    "Multi-State Tax Returns": ["state return", "multi-state", "multistate"],
+    "Property Tax Returns/Payments": ["property tax"],
+    "Federal/State Audit Requirements": ["audit"],
+    "Quarterly Estimated Filings": ["estimate", "quarterly"],
+    "Extension Filings": ["extension"],
+    "Tax Payments": ["payment"],
+    "Tax Provision": ["provision"],
+    "Group Reporting Requirements": ["group report"],
+    "Dep Notices": ["dep notice", "notice"],
+    "Tax Advisory": ["advisory"],
 }
+
+
+def suggest_category(sheet_name):
+    name = sheet_name.lower()
+    best, best_score = UNCLASSIFIED, 0
+    for cat, kws in CATEGORY_KEYWORDS.items():
+        score = sum(1 for kw in kws if kw in name)
+        if score > best_score:
+            best, best_score = cat, score
+    return best
+
+
+# =================================================================
+# 2. FLOW RULES
+# =================================================================
+
+ALLOWED_STAGE_TRANSITIONS = {
+    ("Input", "Input"),
+    ("Input", "Process"),
+    ("Process", "Process"),
+    ("Process", "Output"),
+}
+
 STAGE_COLOR = {
-    "Input": "#2ecc71", "Process": "#2a9d8f", "Output": "#f39c12",
+    "Input": "#2ecc71",
+    "Process": "#2a9d8f",
+    "Output": "#f39c12",
     UNCLASSIFIED: "#7f8c8d",
 }
 STAGE_LEVEL = {"Input": 0, "Process": 1, "Output": 2, UNCLASSIFIED: 3}
 
-# ---------------------------------------------------------------
-# Formula parsing (identical approach to lineage_dashboard.py / the
-# original health_check.py + sheet_tree_server.py)
-# ---------------------------------------------------------------
+
+# =================================================================
+# 3. FORMULA PARSING (same regex approach used across the existing
+#    health-check / sheet-tree tools, condensed here)
+# =================================================================
 
 CELL_REF_RE = re.compile(
     r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
@@ -75,7 +155,11 @@ ROW_ONLY_RE = re.compile(
 )
 FULL_RANGE_ROW_CAP = 5000
 FULL_RANGE_COL_CAP = 200
-MAX_FORMULAS_LISTED = 50
+
+EXTERNAL_REF_RE = re.compile(r"'\[(\d+)\][^'!]*'!" r"|\[(\d+)\][A-Za-z_][A-Za-z0-9_.]*!")
+_MAIN_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_PKG_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 
 
 def _spans_overlap(span, others):
@@ -84,6 +168,8 @@ def _spans_overlap(span, others):
 
 
 def extract_refs(formula, current_sheet, sheet_bounds):
+    """Returns [(sheet, cell, is_range)]. For any range, only the first
+    and last cell are returned - not every cell in between."""
     refs, spans = [], []
     for m in CELL_REF_RE.finditer(formula):
         spans.append(m.span())
@@ -118,7 +204,7 @@ def extract_refs(formula, current_sheet, sheet_bounds):
     return refs
 
 
-def load_formulas(path):
+def load_workbook_formulas(path):
     wb = load_workbook(path, data_only=False, read_only=True)
     formulas, sheet_bounds = {}, {}
     for ws in wb.worksheets:
@@ -133,559 +219,324 @@ def load_formulas(path):
     return formulas, names, sheet_bounds
 
 
-def build_flow_and_arrows(formulas, sheet_bounds, min_cells):
-    """Returns (flow, precedent_cells, dependent_cells) for ONE workbook -
-    same shape/semantics as the original sheet_tree_server.py, used both
-    for the diagram edges and for the Trace Precedents/Dependents arrows
-    drawn in Excel on click."""
+def sheet_flow_within_file(formulas, sheet_bounds):
+    """(src_sheet, dst_sheet) -> cross-sheet formula cell count, within
+    ONE workbook."""
     flow = {}
-    raw_refs = []
-    for (sheet, cell), f in formulas.items():
+    for (sheet, _cell), f in formulas.items():
         refs = extract_refs(f, sheet, sheet_bounds)
-        cross = [(s, c, is_range) for s, c, is_range in refs if s != sheet]
-        for src in {s for s, c, is_range in cross}:
+        for src in {s for s, c, is_range in refs if s != sheet}:
             flow[(src, sheet)] = flow.get((src, sheet), 0) + 1
-        for src_sheet, src_cell, is_range in cross:
-            raw_refs.append((sheet, cell, src_sheet, src_cell))
-
-    precedent_cells, dependent_cells = {}, {}
-    for dst_sheet, dst_cell, src_sheet, src_cell in raw_refs:
-        if flow.get((src_sheet, dst_sheet), 0) < min_cells:
-            continue
-        precedent_cells.setdefault(dst_sheet, set()).add(dst_cell)
-        dependent_cells.setdefault(src_sheet, set()).add(src_cell)
-    return flow, precedent_cells, dependent_cells
+    return flow
 
 
-def export_trace_summary(nodes_info, combined_flow, output_path):
-    """Companion trace-data export, same spirit as the original tools'
-    Sheet Trace workbook: one row per sheet with stage/category, what
-    feeds it, what it feeds, and reference counts."""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Lineage Trace"
-    headers = ["Sheet", "File", "Stage", "Category", "Fed By", "Fed Into", "Input Refs", "Output Refs"]
-    ws.append(headers)
-    for i in range(1, len(headers) + 1):
-        ws.cell(row=1, column=i).font = Font(bold=True)
-
-    for nid, info in sorted(nodes_info.items(), key=lambda kv: (kv[1]["stage"], kv[1]["sheet"])):
-        fed_by = sorted({src for (src, dst) in combined_flow if dst == nid})
-        fed_into = sorted({dst for (src, dst) in combined_flow if src == nid})
-        in_ct = sum(v for (src, dst), v in combined_flow.items() if dst == nid)
-        out_ct = sum(v for (src, dst), v in combined_flow.items() if src == nid)
-        ws.append([
-            info["sheet"], info["file"], info["stage"], info["category"],
-            ", ".join(nodes_info[s]["sheet"] for s in fed_by if s in nodes_info) or "(none)",
-            ", ".join(nodes_info[s]["sheet"] for s in fed_into if s in nodes_info) or "(none)",
-            in_ct, out_ct,
-        ])
-    widths = [22, 22, 12, 26, 30, 30, 10, 10]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    ws.freeze_panes = "A2"
-    wb.save(output_path)
-
-
-# ---------------------------------------------------------------
-# Excel COM automation - identical approach to the original
-# sheet_tree_server.py, adapted to take an explicit workbook path per
-# call since a lineage graph here can span multiple workbooks.
-# ---------------------------------------------------------------
-
-_last_auto_unhidden = {"path": None, "sheet": None}
-
-
-def open_sheet_in_excel(workbook_path, sheet_name, precedent_cells=None, dependent_cells=None):
-    import win32com.client as win32
-    import pywintypes
-    import win32gui
-    import win32process
-    import win32api
-    import win32con
-
-    def com_retry(func, attempts=6, delay=0.4, required=True):
-        last_exc = None
-        for _ in range(attempts):
-            try:
-                return func()
-            except Exception as e:
-                last_exc = e
-                time.sleep(delay)
-        if required:
-            raise last_exc
-        return None
-
-    def norm(p):
-        return os.path.normcase(os.path.normpath(p))
-
-    abs_path = os.path.abspath(workbook_path)
-    target_norm = norm(abs_path)
-    target_base = os.path.basename(abs_path).lower()
-
-    excel, wb = None, None
+def extract_external_link_targets(path):
+    """Resolves Excel's [N] external-workbook index (as seen in a formula
+    like '[1]Sheet1'!A1) to the real external FILE NAME it points to, by
+    walking the xlsx's own zip/XML relationship chain."""
+    targets = {}
     try:
-        excel = win32.GetActiveObject("Excel.Application")
-    except pywintypes.com_error:
-        excel = None
-
-    if excel is not None:
-        for book in excel.Workbooks:
-            try:
-                if norm(book.FullName) == target_norm:
-                    wb = book
-                    break
-            except Exception:
-                continue
-        if wb is None:
-            for book in excel.Workbooks:
-                try:
-                    if book.Name.lower() == target_base:
-                        wb = book
-                        break
-                except Exception:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            if "xl/workbook.xml" not in names or "xl/_rels/workbook.xml.rels" not in names:
+                return targets
+            wb_root = ET.parse(z.open("xl/workbook.xml")).getroot()
+            rids = [er.get(f"{_R_NS}id") for er in wb_root.findall(
+                f".//{_MAIN_NS}externalReferences/{_MAIN_NS}externalReference")]
+            if not rids:
+                return targets
+            rels_root = ET.parse(z.open("xl/_rels/workbook.xml.rels")).getroot()
+            rid_to_target = {rel.get("Id"): rel.get("Target")
+                              for rel in rels_root.findall(f"{_PKG_NS}Relationship")}
+            for idx, rid in enumerate(rids, start=1):
+                link_target = rid_to_target.get(rid)
+                if not link_target:
                     continue
-
-    if excel is None:
-        excel = win32.Dispatch("Excel.Application")
-
-    com_retry(lambda: setattr(excel, "Visible", True))
-    com_retry(lambda: setattr(excel, "DisplayAlerts", False), required=False)
-    com_retry(lambda: setattr(excel, "AskToUpdateLinks", False), required=False)
-
-    if wb is None:
-        wb = com_retry(lambda: excel.Workbooks.Open(abs_path, 0))
-
-    def exit_protected_view():
-        if wb.ProtectedViewWindow is not None:
-            return wb.ProtectedViewWindow.Edit()
-        return wb
-    new_wb = com_retry(exit_protected_view, required=False)
-    if new_wb is not None:
-        wb = new_wb
-
-    com_retry(lambda: setattr(excel, "DisplayAlerts", False), required=False)
-    com_retry(lambda: wb.Activate())
-
-    global _last_auto_unhidden
-    if (_last_auto_unhidden["path"] == target_norm
-            and _last_auto_unhidden["sheet"] is not None
-            and _last_auto_unhidden["sheet"] != sheet_name):
-        com_retry(lambda: setattr(wb.Sheets(_last_auto_unhidden["sheet"]), "Visible", 0), required=False)
-        _last_auto_unhidden["sheet"] = None
-
-    sht = com_retry(lambda: wb.Sheets(sheet_name))
-    was_hidden = com_retry(lambda: sht.Visible != -1, required=False)
-    if was_hidden:
-        com_retry(lambda: setattr(sht, "Visible", -1), required=False)
-    com_retry(lambda: sht.Activate())
-    if was_hidden:
-        _last_auto_unhidden["path"] = target_norm
-        _last_auto_unhidden["sheet"] = sheet_name
-
-    MAX_ARROWS_PER_TYPE = 300
-
-    def draw_arrows(addresses, method_name):
-        addresses = list(addresses)
-        truncated = len(addresses) > MAX_ARROWS_PER_TYPE
-        if truncated:
-            addresses = addresses[:MAX_ARROWS_PER_TYPE]
-        for addr in addresses:
-            com_retry(lambda addr=addr: getattr(sht.Range(addr), method_name)(), required=False)
-        return truncated
-
-    com_retry(lambda: setattr(excel, "ScreenUpdating", False), required=False)
-    try:
-        com_retry(lambda: sht.ClearArrows(), required=False)
-        precedents_truncated = draw_arrows(precedent_cells, "ShowPrecedents") if precedent_cells else False
-        dependents_truncated = draw_arrows(dependent_cells, "ShowDependents") if dependent_cells else False
-    finally:
-        com_retry(lambda: setattr(excel, "ScreenUpdating", True), required=False)
-
-    try:
-        hwnd = wb.Windows(1).Hwnd
-        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
-        win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
-        fg_hwnd = win32gui.GetForegroundWindow()
-        fg_thread = win32process.GetWindowThreadProcessId(fg_hwnd)[0]
-        target_thread = win32process.GetWindowThreadProcessId(hwnd)[0]
-        current_thread = win32api.GetCurrentThreadId()
-        win32process.AttachThreadInput(fg_thread, current_thread, True)
-        win32process.AttachThreadInput(target_thread, current_thread, True)
-        try:
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            win32gui.BringWindowToTop(hwnd)
-            win32gui.SetForegroundWindow(hwnd)
-        finally:
-            win32process.AttachThreadInput(fg_thread, current_thread, False)
-            win32process.AttachThreadInput(target_thread, current_thread, False)
+                link_rels_path = f"xl/externalLinks/_rels/{os.path.basename(link_target)}.rels"
+                if link_rels_path not in names:
+                    continue
+                link_rels_root = ET.parse(z.open(link_rels_path)).getroot()
+                for rel in link_rels_root.findall(f"{_PKG_NS}Relationship"):
+                    tgt = rel.get("Target", "")
+                    if tgt:
+                        targets[idx] = os.path.basename(urllib.parse.unquote(tgt).replace("\\", "/"))
+                        break
     except Exception:
         pass
-
-    return {"precedents_truncated": precedents_truncated, "dependents_truncated": dependents_truncated}
-
-
-# ---------------------------------------------------------------
-# HTML / vis-network page - same interaction model as the original
-# sheet_tree_server.py (search, right-click hide/show, show-all/hide-
-# all/undo panel), recolored for stage + anomaly styling.
-# ---------------------------------------------------------------
-
-HTML_TEMPLATE = """<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
-<style>
-  html, body { margin:0; padding:0; background:#111111; }
-  #tree { width:100vw; height:100vh; }
-  #hint {
-    position:fixed; top:10px; left:10px; color:white; font-family:sans-serif;
-    font-size:13px; background:rgba(0,0,0,0.6); padding:8px 14px; border-radius:6px;
-    max-width: 520px; z-index: 1000;
-  }
-  #searchRow { margin-bottom:6px; }
-  #searchBox { width: 220px; padding: 4px 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #fff; font-size: 13px; }
-  #searchGoBtn { padding: 4px 10px; border-radius: 4px; border: 1px solid #555; background: #333; color: #fff; font-size: 13px; cursor: pointer; margin-left: 4px; }
-  #sheetPanel {
-    position:fixed; top:10px; right:10px; color:white; font-family:sans-serif;
-    font-size:13px; background:rgba(0,0,0,0.65); padding:8px 14px; border-radius:6px;
-    max-width: 280px; max-height: 85vh; z-index: 1000; overflow-y:auto;
-  }
-  #sheetPanelHeader { font-weight:bold; margin-bottom:6px; }
-  #sheetCheckboxes label { display:block; margin:2px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .swatch { display:inline-block; width:11px; height:11px; border-radius:2px; margin-right:4px; vertical-align:middle; }
-  .line { display:inline-block; width:18px; height:2px; margin-right:4px; vertical-align:middle; }
-</style>
-</head>
-<body>
-<div id="hint">
-  <div id="searchRow">
-    <input type="text" id="searchBox" list="sheetList" placeholder="Search sheet name...">
-    <button id="searchGoBtn">Find</button>
-    <datalist id="sheetList"></datalist>
-  </div>
-  <span class="swatch" style="background:#2ecc71;"></span>Input&nbsp;
-  <span class="swatch" style="background:#2a9d8f;"></span>Process&nbsp;
-  <span class="swatch" style="background:#f39c12;"></span>Output&nbsp;
-  <span class="swatch" style="background:#7f8c8d;"></span>Unclassified<br>
-  <span class="line" style="background:#888888;"></span>Normal link&nbsp;
-  <span class="line" style="border-bottom:2px dashed #8e6bbf;"></span>Touches unclassified&nbsp;
-  <span class="line" style="border-bottom:3px dashed #e63946;"></span><b style="color:#e63946;">Anomaly</b><br>
-  Click a sheet box to switch to it in Excel (draws Trace Precedents/Dependents arrows). Right-click to hide/show it.<br>
-  <label style="margin-right:12px;"><input type="checkbox" id="showPrecedents" checked> Precedent arrows</label>
-  <label><input type="checkbox" id="showDependents" checked> Dependent arrows</label>
-  <br><span id="status" style="opacity:0.8;"></span>
-</div>
-<div id="sheetPanel">
-  <div id="sheetPanelHeader">
-    Sheets <span id="togglePanelBtn" style="cursor:pointer; opacity:0.7;">[hide list]</span><br>
-    <span id="showAllBtn" style="cursor:pointer; text-decoration:underline; margin-right:10px;">Show all</span>
-    <span id="hideAllBtn" style="cursor:pointer; text-decoration:underline; margin-right:10px;">Hide all</span>
-    <span id="undoBtn" style="cursor:pointer; text-decoration:underline;">Undo</span>
-  </div>
-  <div id="sheetCheckboxes"></div>
-</div>
-<div id="tree"></div>
-<script type="text/javascript">
-  var nodes = new vis.DataSet(__NODES__);
-  var edges = new vis.DataSet(__EDGES__);
-  var container = document.getElementById('tree');
-  var data = { nodes: nodes, edges: edges };
-  var options = {
-    layout: { hierarchical: { enabled: true, direction: "LR", sortMethod: "directed",
-      levelSeparation: 220, nodeSpacing: 130, treeSpacing: 160 } },
-    physics: { hierarchicalRepulsion: { nodeDistance: 150 }, solver: "hierarchicalRepulsion" },
-    edges: { smooth: { type: "cubicBezier", forceDirection: "horizontal" },
-      arrows: { to: { enabled: true } }, font: { color: "#ffffff" } },
-    nodes: { font: { color: "#ffffff", size: 13 } }
-  };
-  var network = new vis.Network(container, data, options);
-  network.once("stabilizationIterationsDone", function () { network.setOptions({ physics: false }); });
-
-  network.on("click", function (params) {
-    if (params.nodes.length > 0) {
-      var id = params.nodes[0];
-      var statusEl = document.getElementById('status');
-      var showPre = document.getElementById('showPrecedents').checked;
-      var showDep = document.getElementById('showDependents').checked;
-      statusEl.innerText = "Opening: " + id + " ...";
-      fetch('/open?id=' + encodeURIComponent(id) + '&precedents=' + showPre + '&dependents=' + showDep)
-        .then(function(r) { return r.text(); })
-        .then(function(text) {
-          statusEl.innerText = text.indexOf("ok") === 0
-            ? "Opened: " + id + (text.length > 2 ? " - " + text.slice(4, -1) : "")
-            : "Error opening " + id + ": " + text;
-        })
-        .catch(function(err) { statusEl.innerText = "Could not reach local server: " + err; });
-    }
-  });
-
-  network.on("oncontext", function (params) {
-    params.event.preventDefault();
-    var nodeId = network.getNodeAt(params.pointer.DOM);
-    if (nodeId) {
-      var node = nodes.get(nodeId);
-      applyChanges([{ id: nodeId, hidden: !node.hidden }]);
-    }
-  });
-
-  var allSheetIds = nodes.getIds();
-  var checkboxContainer = document.getElementById('sheetCheckboxes');
-  var undoStack = [];
-
-  function setHidden(id, hidden) {
-    nodes.update({ id: id, hidden: hidden });
-    var cb = checkboxContainer.querySelector('input[data-sheet-id="' + id + '"]');
-    if (cb) cb.checked = !hidden;
-  }
-  function applyChanges(changes) {
-    var undoEntry = [];
-    changes.forEach(function(change) {
-      var node = nodes.get(change.id);
-      undoEntry.push({ id: change.id, prevHidden: !!node.hidden });
-      setHidden(change.id, change.hidden);
-    });
-    undoStack.push(undoEntry);
-  }
-
-  allSheetIds.slice().sort().forEach(function(id) {
-    var node = nodes.get(id);
-    var label = document.createElement('label');
-    var cb = document.createElement('input');
-    cb.type = 'checkbox'; cb.checked = true; cb.dataset.sheetId = id;
-    cb.addEventListener('change', function() { applyChanges([{ id: id, hidden: !cb.checked }]); });
-    label.appendChild(cb);
-    label.appendChild(document.createTextNode(' ' + node.label.replace(/\\n/g, ' ')));
-    checkboxContainer.appendChild(label);
-  });
-
-  document.getElementById('showAllBtn').addEventListener('click', function() {
-    applyChanges(allSheetIds.map(function(id) { return { id: id, hidden: false }; }));
-  });
-  document.getElementById('hideAllBtn').addEventListener('click', function() {
-    applyChanges(allSheetIds.map(function(id) { return { id: id, hidden: true }; }));
-  });
-  document.getElementById('undoBtn').addEventListener('click', function() {
-    var entry = undoStack.pop();
-    if (!entry) return;
-    entry.forEach(function(change) { setHidden(change.id, change.prevHidden); });
-  });
-  document.getElementById('togglePanelBtn').addEventListener('click', function() {
-    var listVisible = checkboxContainer.style.display !== 'none';
-    checkboxContainer.style.display = listVisible ? 'none' : 'block';
-    ['showAllBtn','hideAllBtn','undoBtn'].forEach(function(bid) {
-      document.getElementById(bid).style.display = listVisible ? 'none' : 'inline';
-    });
-    this.innerText = listVisible ? '[show list]' : '[hide list]';
-  });
-
-  var sheetListEl = document.getElementById('sheetList');
-  allSheetIds.slice().sort().forEach(function(id) {
-    var opt = document.createElement('option');
-    opt.value = nodes.get(id).label.replace(/\\n/g, ' ');
-    sheetListEl.appendChild(opt);
-  });
-
-  var highlightState = null;
-  function clearHighlight() {
-    if (highlightState) {
-      nodes.update({ id: highlightState.id, color: highlightState.originalColor, borderWidth: highlightState.originalBorderWidth });
-      highlightState = null;
-    }
-  }
-  function highlightSheet(rawName) {
-    clearHighlight();
-    var name = (rawName || '').trim();
-    if (!name) return false;
-    var lower = name.toLowerCase();
-    var match = allSheetIds.find(function(id) { return nodes.get(id).label.replace(/\\n/g,' ').toLowerCase() === lower; });
-    if (!match) {
-      match = allSheetIds.find(function(id) { return nodes.get(id).label.replace(/\\n/g,' ').toLowerCase().indexOf(lower) !== -1; });
-    }
-    if (!match) return false;
-    setHidden(match, false);
-    var node = nodes.get(match);
-    var baseColor = (typeof node.color === 'string') ? node.color : (node.color && node.color.background) || '#2a9d8f';
-    highlightState = { id: match, originalColor: node.color, originalBorderWidth: node.borderWidth || 1 };
-    nodes.update({ id: match, borderWidth: 6, color: { background: baseColor, border: '#ff0055', highlight: { background: baseColor, border: '#ff0055' } } });
-    network.selectNodes([match]);
-    network.focus(match, { scale: 1.3, animation: { duration: 500, easingFunction: 'easeInOutQuad' } });
-    return match;
-  }
-  function runSearch() {
-    var val = document.getElementById('searchBox').value;
-    var statusEl = document.getElementById('status');
-    var found = highlightSheet(val);
-    statusEl.innerText = found ? ('Found: ' + val) : ('No sheet matching "' + val + '"');
-  }
-  document.getElementById('searchGoBtn').addEventListener('click', runSearch);
-  document.getElementById('searchBox').addEventListener('keydown', function(e) { if (e.key === 'Enter') runSearch(); });
-  document.getElementById('searchBox').addEventListener('input', function(e) { if (e.target.value.trim() === '') clearHighlight(); });
-
-  window.addEventListener('resize', function() { network.redraw(); });
-</script>
-</body>
-</html>
-"""
+    return targets
 
 
-class Handler(BaseHTTPRequestHandler):
-    html_content = ""
-    node_file_path = {}      # node id -> workbook path
-    node_sheet_name = {}     # node id -> real sheet name (as it exists in that workbook)
-    precedent_cells = {}     # node id -> [cell addresses]
-    dependent_cells = {}     # node id -> [cell addresses]
+def cross_file_flow(file_paths, per_file_formulas):
+    """Returns {(src_file, dst_file): formula_cell_count} - FILE-level
+    only (Excel's own external-link syntax doesn't reliably expose which
+    sheet on the source side it came from, so this stays file-to-file,
+    shown separately from the sheet-level flow/anomaly rules)."""
+    by_stem = {}
+    for name in file_paths:
+        by_stem.setdefault(os.path.splitext(name)[0].lower(), []).append(name)
 
-    def log_message(self, format, *args):
-        pass
+    edges = {}
+    for fname, fpath in file_paths.items():
+        targets = extract_external_link_targets(fpath)
+        if not targets:
+            continue
+        for (_sheet, _cell), f in per_file_formulas.get(fname, {}).items():
+            for m in EXTERNAL_REF_RE.finditer(f):
+                idx = int(m.group(1) or m.group(2))
+                ext_name = targets.get(idx)
+                if not ext_name:
+                    continue
+                match = ext_name if ext_name in file_paths else None
+                if not match:
+                    cands = by_stem.get(os.path.splitext(ext_name)[0].lower(), [])
+                    if len(cands) == 1:
+                        match = cands[0]
+                if not match or match == fname:
+                    continue
+                edges[(match, fname)] = edges.get((match, fname), 0) + 1
+    return edges
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path in ("/", "/lineage_flow.html"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(Handler.html_content.encode("utf-8"))
-        elif parsed.path == "/open":
-            qs = parse_qs(parsed.query)
-            node = qs.get("id", [None])[0]
-            want_pre = qs.get("precedents", ["true"])[0].lower() == "true"
-            want_dep = qs.get("dependents", ["true"])[0].lower() == "true"
-            status = "ok"
-            try:
-                path = Handler.node_file_path.get(node)
-                sheet = Handler.node_sheet_name.get(node)
-                if not path or not sheet:
-                    raise RuntimeError("Unknown node")
-                pre = sorted(Handler.precedent_cells.get(node, [])) if want_pre else []
-                dep = sorted(Handler.dependent_cells.get(node, [])) if want_dep else []
-                result = open_sheet_in_excel(path, sheet, precedent_cells=pre, dependent_cells=dep)
-                notes = []
-                if result.get("precedents_truncated"):
-                    notes.append("precedents capped at 300")
-                if result.get("dependents_truncated"):
-                    notes.append("dependents capped at 300")
-                if notes:
-                    status = "ok (" + ", ".join(notes) + ")"
-            except Exception as e:
-                status = str(e)
-                print(f"[!] Could not open node '{node}' in Excel: {e}")
-                import traceback
-                traceback.print_exc()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(status.encode("utf-8"))
-        else:
-            self.send_response(404)
-            self.end_headers()
 
+@st.cache_data(show_spinner=False)
+def scan_file_cached(path, fingerprint):
+    return load_workbook_formulas(path)
+
+
+def fingerprint(path):
+    st_ = os.stat(path)
+    return (st_.st_mtime, st_.st_size)
+
+
+def node_id(fname, sheet):
+    return f"{fname}::{sheet}"
+
+
+# =================================================================
+# 4. STREAMLIT UI
+#    The interactive flow visual itself lives in lineage_flow_visual.py,
+#    a separate standalone script launched as its own local-server
+#    process (same pattern as the original Sheet_Trace_Visual /
+#    sheet_tree_server.py split) - this keeps the dashboard itself fast
+#    and focused on scanning + classification, and gives the visual the
+#    full feature set (click-to-open in Excel, search, show/hide panel)
+#    without that overhead running inside every Streamlit rerun.
+# =================================================================
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python lineage_flow_visual.py <handoff.json> [min_cells]")
-        sys.exit(1)
-    handoff_path = sys.argv[1]
-    min_cells = DEFAULT_MIN_CELLS
-    if len(sys.argv) >= 3:
-        try:
-            min_cells = int(sys.argv[2])
-        except ValueError:
-            pass
+    st.set_page_config(page_title="Data Lineage Flow Classifier", layout="wide")
+    st.title("Data Lineage Flow Classifier")
+    st.caption(
+        "Classify every sheet into a fixed Input / Process / Output category, then see the real "
+        "formula-flow between sheets. Expected flow: Input -> Input/Process, Process -> Process/Output. "
+        "Anything else is flagged as an anomaly instead of hidden."
+    )
 
-    with open(handoff_path, "r", encoding="utf-8") as f:
-        handoff = json.load(f)
-    files = handoff["files"]              # {filename: path}
-    classification = handoff.get("classification", {})  # {"file::sheet": {"stage":..,"category":..}}
-    multi_file = len(files) > 1
+    mode = st.radio("Scope", ["Single workpaper", "Folder (entity - multiple workbooks)"], horizontal=True)
 
-    combined_flow = {}
-    node_info = {}  # node id -> {file, sheet, stage, category}
-    precedent_cells, dependent_cells = {}, {}
-    node_file_path, node_sheet_name = {}, {}
+    file_paths = {}
+    tmp_dir = tempfile.gettempdir()
 
-    for fname, fpath in files.items():
-        formulas, sheet_names, sheet_bounds = load_formulas(fpath)
-        flow, prec, dep = build_flow_and_arrows(formulas, sheet_bounds, min_cells)
-        for sheet in sheet_names:
-            nid = f"{fname}::{sheet}"
-            cls = classification.get(nid, {})
-            node_info[nid] = {
-                "file": fname, "sheet": sheet,
-                "stage": cls.get("stage", UNCLASSIFIED),
-                "category": cls.get("category", UNCLASSIFIED),
-            }
-            node_file_path[nid] = fpath
-            node_sheet_name[nid] = sheet
-            if sheet in prec:
-                precedent_cells[nid] = prec[sheet]
-            if sheet in dep:
-                dependent_cells[nid] = dep[sheet]
-        for (src, dst), cnt in flow.items():
-            combined_flow[(f"{fname}::{src}", f"{fname}::{dst}")] = cnt
+    if mode == "Single workpaper":
+        uploaded = st.file_uploader("Drop your .xlsx / .xlsm workbook", type=["xlsx", "xlsm"])
+        if uploaded is not None:
+            path = os.path.join(tmp_dir, uploaded.name)
+            with open(path, "wb") as f:
+                f.write(uploaded.getbuffer())
+            file_paths[uploaded.name] = path
+    else:
+        folder = st.text_input("Folder path containing this entity's workbooks")
+        include_sub = st.checkbox("Include subfolders", value=False)
+        if folder and os.path.isdir(folder):
+            if include_sub:
+                for root, _d, files in os.walk(folder):
+                    for fn in files:
+                        if fn.lower().endswith((".xlsx", ".xlsm")):
+                            file_paths.setdefault(fn, os.path.join(root, fn))
+            else:
+                for fn in sorted(os.listdir(folder)):
+                    if fn.lower().endswith((".xlsx", ".xlsm")):
+                        file_paths[fn] = os.path.join(folder, fn)
+            if not file_paths:
+                st.warning("No .xlsx/.xlsm files found in that folder.")
+        elif folder:
+            st.warning("That folder path doesn't exist.")
 
-    if not combined_flow:
-        print("No cross-sheet formula links found across the given file(s) - nothing to draw.")
+    if not file_paths:
+        st.info("Provide a workbook (or folder) to begin.")
         return
 
+    if st.button("Scan", type="primary"):
+        per_file_formulas, per_file_bounds, sheets_by_file = {}, {}, {}
+        total = len(file_paths)
+        prog = st.progress(0.0, text=f"Scanning 0/{total} file(s)...")
+
+        # Each file is independent work (open, parse formulas via openpyxl/
+        # zipfile) and most of the time per file is disk I/O + XML parsing,
+        # both of which release the GIL - so a thread pool gives a real
+        # speedup here without process-pool spawn/pickling overhead, same
+        # approach the original batch folder scan used.
+        max_workers = min(8, max(1, total))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_name = {
+                pool.submit(scan_file_cached, fpath, fingerprint(fpath)): fname
+                for fname, fpath in file_paths.items()
+            }
+            done = 0
+            for fut in concurrent.futures.as_completed(future_to_name):
+                fname = future_to_name[fut]
+                formulas, names, bounds = fut.result()
+                per_file_formulas[fname] = formulas
+                per_file_bounds[fname] = bounds
+                sheets_by_file[fname] = names
+                done += 1
+                prog.progress(done / total, text=f"Scanning {done}/{total} file(s)...")
+        prog.empty()
+
+        # Rebuilt in original file order (as_completed finishes out of
+        # order) so the classification table below lists consistently.
+        all_sheets = [(fname, s) for fname in file_paths for s in sheets_by_file[fname]]
+
+        st.session_state["file_paths"] = file_paths
+        st.session_state["per_file_formulas"] = per_file_formulas
+        st.session_state["per_file_bounds"] = per_file_bounds
+        st.session_state["all_sheets"] = all_sheets
+        st.session_state.pop("classification_df", None)
+        st.session_state.pop("confirmed", None)
+
+    if "all_sheets" not in st.session_state:
+        return
+
+    all_sheets = st.session_state["all_sheets"]
+    multi_file = len(st.session_state["file_paths"]) > 1
+    st.success(f"{len(all_sheets)} sheet(s) across {len(st.session_state['file_paths'])} file(s).")
+
+    st.divider()
+    st.subheader("Classify each sheet")
+    st.caption("Categories come from the fixed taxonomy at the top of this script - edit CATEGORY_TAXONOMY to change them. Suggestions are pre-filled from sheet-name keywords; review before confirming.")
+
+    if "classification_df" not in st.session_state:
+        rows = [{"File": fname, "Sheet": sheet, "Category": suggest_category(sheet)}
+                for fname, sheet in all_sheets]
+        st.session_state["classification_df"] = pd.DataFrame(rows)
+
+    edited = st.data_editor(
+        st.session_state["classification_df"],
+        column_config={
+            "Category": st.column_config.SelectboxColumn(options=ALL_CATEGORIES, required=True, width="medium"),
+            "File": st.column_config.TextColumn(disabled=True),
+            "Sheet": st.column_config.TextColumn(disabled=True),
+        },
+        use_container_width=True,
+        num_rows="fixed",
+        hide_index=True,
+        key="classification_editor",
+    )
+    st.session_state["classification_df"] = edited
+
+    if st.button("Confirm Classification", type="primary"):
+        st.session_state["confirmed"] = {
+            (row["File"], row["Sheet"]): row["Category"] for _, row in edited.iterrows()
+        }
+        st.success(f"Locked in {len(st.session_state['confirmed'])} sheet classification(s).")
+
+    if "confirmed" not in st.session_state:
+        return
+
+    confirmed = st.session_state["confirmed"]
+
+    st.divider()
+    st.subheader("Flow Summary")
+
+    per_file_formulas = st.session_state["per_file_formulas"]
+    per_file_bounds = st.session_state["per_file_bounds"]
+
+    combined_flow = {}
+    for fname, formulas in per_file_formulas.items():
+        for (src, dst), cnt in sheet_flow_within_file(formulas, per_file_bounds[fname]).items():
+            combined_flow[(node_id(fname, src), node_id(fname, dst))] = cnt
+
+    def stage_of(nid):
+        fname, sheet = nid.split("::", 1)
+        return CATEGORY_TO_STAGE.get(confirmed.get((fname, sheet), UNCLASSIFIED), UNCLASSIFIED)
+
     def label_of(nid):
-        info = node_info[nid]
-        return f"{info['sheet']}\n({info['file']})" if multi_file else info["sheet"]
+        fname, sheet = nid.split("::", 1)
+        return f"{sheet} ({fname})" if multi_file else sheet
 
-    nodes_json = []
-    for nid, info in node_info.items():
-        stage = info["stage"]
-        nodes_json.append({
-            "id": nid, "label": label_of(nid), "shape": "box",
-            "level": STAGE_LEVEL.get(stage, 3),
-            "title": f"{label_of(nid)}\nStage: {stage}\nCategory: {info['category']}\nClick to switch to this sheet in Excel",
-            "color": {"background": STAGE_COLOR.get(stage, STAGE_COLOR[UNCLASSIFIED]),
-                      "border": "#ffffff" if stage != UNCLASSIFIED else "#666666"},
-            "borderWidth": 3 if stage != UNCLASSIFIED else 1,
-        })
-
-    edges_json = []
+    normal_ct = anomaly_ct = unclassified_ct = 0
+    anomaly_rows, unclassified_rows = [], []
     for (src, dst), cnt in combined_flow.items():
-        s_stage, d_stage = node_info[src]["stage"], node_info[dst]["stage"]
+        s_stage, d_stage = stage_of(src), stage_of(dst)
         if s_stage == UNCLASSIFIED or d_stage == UNCLASSIFIED:
-            edges_json.append({"from": src, "to": dst, "label": str(cnt), "color": "#8e6bbf",
-                                "dashes": [2, 2], "title": f"{cnt} formula cell(s) - touches an unclassified sheet"})
+            unclassified_ct += 1
+            unclassified_rows.append({"From": label_of(src), "To": label_of(dst), "Formula Cells": cnt})
         elif (s_stage, d_stage) in ALLOWED_STAGE_TRANSITIONS:
-            edges_json.append({"from": src, "to": dst, "label": str(cnt), "color": "#888888",
-                                "title": f"{cnt} formula cell(s) - {s_stage} -> {d_stage}"})
+            normal_ct += 1
         else:
-            edges_json.append({"from": src, "to": dst, "label": f"ANOMALY ({cnt})", "color": "#e63946",
-                                "dashes": [6, 3], "width": 3,
-                                "title": f"Rule violation: {s_stage} -> {d_stage} is not an allowed transition"})
+            anomaly_ct += 1
+            anomaly_rows.append({"From": label_of(src), "From Stage": s_stage, "To": label_of(dst),
+                                  "To Stage": d_stage, "Formula Cells": cnt})
 
-    html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes_json)).replace("__EDGES__", json.dumps(edges_json))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Normal links", normal_ct)
+    c2.metric("Anomalies (rule broken)", anomaly_ct)
+    c3.metric("Links touching unclassified sheets", unclassified_ct)
 
-    # Companion trace-data export, written next to the handoff file.
-    try:
-        out_dir = os.path.dirname(os.path.abspath(handoff_path))
-        trace_path = os.path.join(out_dir, "lineage_trace_data.xlsx")
-        export_trace_summary(node_info, combined_flow, trace_path)
-        print(f"Wrote lineage trace data to {trace_path}")
-    except Exception as e:
-        print(f"[!] Could not write trace data workbook: {e}")
+    if anomaly_rows:
+        st.subheader(f"Anomalies ({len(anomaly_rows)})")
+        st.caption("These formula links go against the expected Input -> Process -> Output direction.")
+        st.dataframe(anomaly_rows, use_container_width=True)
 
-    Handler.html_content = html
-    Handler.node_file_path = node_file_path
-    Handler.node_sheet_name = node_sheet_name
-    Handler.precedent_cells = precedent_cells
-    Handler.dependent_cells = dependent_cells
+    if unclassified_rows:
+        with st.expander(f"Links touching unclassified sheets ({len(unclassified_rows)})"):
+            st.dataframe(unclassified_rows, use_container_width=True)
 
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
-    actual_port = server.server_address[1]
-    url = f"http://127.0.0.1:{actual_port}/"
-    print(f"\nServing lineage flow visual at {url}")
-    print("Leave this window open while you use it - Ctrl+C here to stop.")
-    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopped.")
+    if multi_file:
+        xfile_edges = cross_file_flow(st.session_state["file_paths"], per_file_formulas)
+        st.subheader(f"Cross-File Dependencies ({len(xfile_edges)})")
+        st.caption(
+            "Files that reference each other directly via an external-workbook formula link - shown at the "
+            "file level (Excel's own link format doesn't reliably expose the source sheet)."
+        )
+        if xfile_edges:
+            st.dataframe(
+                [{"From File": s, "To File": d, "Formula Cells": c} for (s, d), c in xfile_edges.items()],
+                use_container_width=True,
+            )
+        else:
+            st.write("No direct external-workbook formula links found between files in this folder.")
+
+    # -----------------------------------------------------------
+    # Launch the full interactive visual - its own process, its own
+    # local server, with the full feature set (click-to-open in Excel,
+    # search, show/hide panel). See lineage_flow_visual.py.
+    # -----------------------------------------------------------
+    st.divider()
+    st.subheader("Interactive Flow Visual")
+    st.caption(
+        "Opens in your browser via a separate local process - keeps this dashboard responsive, and gives you "
+        "click-to-open-in-Excel, search, and a show/hide panel on top of the same stage/anomaly coloring."
+    )
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    visual_script_name = st.text_input("Flow visual script filename", value="lineage_flow_visual.py")
+    visual_script_path = os.path.join(script_dir, visual_script_name)
+
+    if st.button("Open Interactive Flow Visual", type="primary"):
+        if not os.path.exists(visual_script_path):
+            st.error(f"Couldn't find {visual_script_name} in {script_dir}. Make sure it's saved in the same folder as this dashboard.")
+        else:
+            handoff = {
+                "files": st.session_state["file_paths"],
+                "classification": {
+                    f"{fname}::{sheet}": {"stage": CATEGORY_TO_STAGE.get(cat, UNCLASSIFIED), "category": cat}
+                    for (fname, sheet), cat in confirmed.items()
+                },
+            }
+            handoff_path = os.path.join(tmp_dir, "lineage_handoff.json")
+            with open(handoff_path, "w", encoding="utf-8") as f:
+                json.dump(handoff, f)
+            subprocess.Popen([sys.executable, visual_script_path, handoff_path])
+            st.success(f"Launched {visual_script_name} - check your browser for a new tab.")
 
 
 if __name__ == "__main__":
