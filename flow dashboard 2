@@ -115,7 +115,65 @@ def suggest_category(sheet_name):
         score = sum(1 for kw in kws if kw in name)
         if score > best_score:
             best, best_score = cat, score
+    return best, best_score
+
+
+def connectivity_lean(fed_by, fed_into):
+    """Pure structural signal, no name-guessing: a sheet nothing feeds
+    but that feeds others looks like a source (Input); a sheet that both
+    receives and sends looks like a transformation step (Process); a
+    sheet that only receives looks like an end deliverable (Output). An
+    isolated sheet (neither) gives no structural signal at all."""
+    if fed_by == 0 and fed_into > 0:
+        return "Input"
+    if fed_by > 0 and fed_into > 0:
+        return "Process"
+    if fed_by > 0 and fed_into == 0:
+        return "Output"
+    return None
+
+
+def suggest_stage(sheet_name, fed_by, fed_into):
+    """Combines both signals: a keyword hit is the stronger, more
+    specific signal (it points at an actual named category) so it wins
+    when present; connectivity is the fallback for sheets with no
+    recognizable name but a clear structural role."""
+    _cat, score = suggest_category(sheet_name)
+    if score > 0:
+        return CATEGORY_TO_STAGE.get(_cat, UNCLASSIFIED)
+    lean = connectivity_lean(fed_by, fed_into)
+    return lean if lean else UNCLASSIFIED
+
+
+def suggest_category_within_stage(sheet_name, stage):
+    """Best keyword-matched category, restricted to one stage's fixed
+    list - used once a sheet has already been sorted into a stage, to
+    pre-fill its sub-heading (category) dropdown."""
+    if stage not in CATEGORY_TAXONOMY:
+        return None
+    name = sheet_name.lower()
+    best, best_score = None, 0
+    for cat in CATEGORY_TAXONOMY[stage]:
+        score = sum(1 for kw in CATEGORY_KEYWORDS.get(cat, []) if kw in name)
+        if score > best_score:
+            best, best_score = cat, score
     return best
+
+
+def sheet_connectivity_stats(per_file_formulas, per_file_bounds, all_sheets):
+    """(fed_by_count, fed_into_count) per (file, sheet), from real
+    intra-file cross-sheet formula links - the structural half of the
+    suggestion signal."""
+    stats = {}
+    for fname, formulas in per_file_formulas.items():
+        flow = sheet_flow_within_file(formulas, per_file_bounds[fname])
+        fed_by, fed_into = {}, {}
+        for (src, dst), _cnt in flow.items():
+            fed_into.setdefault(src, set()).add(dst)
+            fed_by.setdefault(dst, set()).add(src)
+        for _f, sheet in [s for s in all_sheets if s[0] == fname]:
+            stats[(fname, sheet)] = (len(fed_by.get(sheet, ())), len(fed_into.get(sheet, ())))
+    return stats
 
 
 # =================================================================
@@ -313,6 +371,41 @@ def node_id(fname, sheet):
     return f"{fname}::{sheet}"
 
 
+def write_temp_file(tmp_dir, filename, data_bytes):
+    """Writes data_bytes to tmp_dir/filename - but ONLY if that exact path
+    doesn't already hold identical content, and falls back to a content-
+    hashed filename if the target path is locked (most commonly because
+    the flow visual has this same file open in real Excel via COM right
+    now, which is a completely reasonable thing to want to do while
+    reviewing). Returns the path actually holding the content."""
+    import hashlib
+    target = os.path.join(tmp_dir, filename)
+    digest = hashlib.md5(data_bytes).hexdigest()[:10]
+
+    def _matches(path):
+        try:
+            with open(path, "rb") as f:
+                return f.read() == data_bytes
+        except (PermissionError, OSError):
+            return False
+
+    if os.path.exists(target) and _matches(target):
+        return target
+
+    try:
+        with open(target, "wb") as f:
+            f.write(data_bytes)
+        return target
+    except (PermissionError, OSError):
+        stem, ext = os.path.splitext(filename)
+        fallback = os.path.join(tmp_dir, f"{stem}_{digest}{ext}")
+        if os.path.exists(fallback) and _matches(fallback):
+            return fallback
+        with open(fallback, "wb") as f:
+            f.write(data_bytes)
+        return fallback
+
+
 # =================================================================
 # Excel export - every dashboard section becomes its own tab in one
 # workbook, so the whole review can be handed off as a single file.
@@ -372,7 +465,7 @@ def build_report_workbook_bytes(summary, classification_df, normal_rows, anomaly
 
 # =================================================================
 # STREAMLIT UI
-#    The interactive flow visual itself lives in lineage_flow_visual.py,
+#    The interactive flow visual itself lives in flow_visual.py,
 #    a separate standalone script launched as its own local-server
 #    process (same pattern as the original Sheet_Trace_Visual /
 #    sheet_tree_server.py split) - this keeps the dashboard itself fast
@@ -398,9 +491,7 @@ def main():
     if mode == "Single workpaper":
         uploaded = st.file_uploader("Drop your .xlsx / .xlsm workbook", type=["xlsx", "xlsm"])
         if uploaded is not None:
-            path = os.path.join(tmp_dir, uploaded.name)
-            with open(path, "wb") as f:
-                f.write(uploaded.getbuffer())
+            path = write_temp_file(tmp_dir, uploaded.name, uploaded.getbuffer().tobytes())
             file_paths[uploaded.name] = path
     else:
         folder = st.text_input("Folder path containing this entity's workbooks")
@@ -441,25 +532,41 @@ def main():
                 for fname, fpath in file_paths.items()
             }
             done = 0
+            failed = []
             for fut in concurrent.futures.as_completed(future_to_name):
                 fname = future_to_name[fut]
-                formulas, names, bounds = fut.result()
-                per_file_formulas[fname] = formulas
-                per_file_bounds[fname] = bounds
-                sheets_by_file[fname] = names
+                try:
+                    formulas, names, bounds = fut.result()
+                    per_file_formulas[fname] = formulas
+                    per_file_bounds[fname] = bounds
+                    sheets_by_file[fname] = names
+                except (PermissionError, OSError) as e:
+                    # Most commonly: this exact file is open elsewhere right
+                    # now (e.g. in Excel, via the flow visual's click-to-open)
+                    # - skip it rather than failing the whole batch.
+                    failed.append((fname, str(e)))
                 done += 1
                 prog.progress(done / total, text=f"Scanning {done}/{total} file(s)...")
         prog.empty()
 
+        if failed:
+            st.warning(
+                "Couldn't read " + ", ".join(f"'{n}'" for n, _ in failed) +
+                " - likely open elsewhere right now (e.g. in Excel). Close it and scan again to include it."
+            )
+            for fname, _ in failed:
+                file_paths.pop(fname, None)
+
         # Rebuilt in original file order (as_completed finishes out of
         # order) so the classification table below lists consistently.
-        all_sheets = [(fname, s) for fname in file_paths for s in sheets_by_file[fname]]
+        all_sheets = [(fname, s) for fname in file_paths for s in sheets_by_file.get(fname, [])]
 
         st.session_state["file_paths"] = file_paths
         st.session_state["per_file_formulas"] = per_file_formulas
         st.session_state["per_file_bounds"] = per_file_bounds
         st.session_state["all_sheets"] = all_sheets
-        st.session_state.pop("classification_df", None)
+        st.session_state.pop("stage_df", None)
+        st.session_state.pop("category_choices", None)
         st.session_state.pop("confirmed", None)
 
     if "all_sheets" not in st.session_state:
@@ -467,36 +574,91 @@ def main():
 
     all_sheets = st.session_state["all_sheets"]
     multi_file = len(st.session_state["file_paths"]) > 1
+    per_file_formulas = st.session_state["per_file_formulas"]
+    per_file_bounds = st.session_state["per_file_bounds"]
     st.success(f"{len(all_sheets)} sheet(s) across {len(st.session_state['file_paths'])} file(s).")
 
     st.divider()
     st.subheader("Classify each sheet")
-    st.caption("Categories come from the fixed taxonomy at the top of this script - edit CATEGORY_TAXONOMY to change them. Suggestions are pre-filled from sheet-name keywords; review before confirming.")
+    st.caption(
+        "Step 1: pick each sheet's stage. Suggestions combine sheet-name keywords with real structural signal - "
+        "a sheet nothing feeds but that feeds others looks like an Input, one that both receives and sends looks "
+        "like a Process, one that only receives looks like an Output."
+    )
 
-    if "classification_df" not in st.session_state:
-        rows = [{"File": fname, "Sheet": sheet, "Category": suggest_category(sheet)}
-                for fname, sheet in all_sheets]
-        st.session_state["classification_df"] = pd.DataFrame(rows)
+    sheet_stats = sheet_connectivity_stats(per_file_formulas, per_file_bounds, all_sheets)
 
-    edited = st.data_editor(
-        st.session_state["classification_df"],
+    if "stage_df" not in st.session_state:
+        rows = []
+        for fname, sheet in all_sheets:
+            fed_by, fed_into = sheet_stats.get((fname, sheet), (0, 0))
+            rows.append({"File": fname, "Sheet": sheet, "Stage": suggest_stage(sheet, fed_by, fed_into)})
+        st.session_state["stage_df"] = pd.DataFrame(rows)
+
+    stage_edited = st.data_editor(
+        st.session_state["stage_df"],
         column_config={
-            "Category": st.column_config.SelectboxColumn(options=ALL_CATEGORIES, required=True, width="medium"),
+            "Stage": st.column_config.SelectboxColumn(options=["Input", "Process", "Output", UNCLASSIFIED], required=True),
             "File": st.column_config.TextColumn(disabled=True),
             "Sheet": st.column_config.TextColumn(disabled=True),
         },
         use_container_width=True,
         num_rows="fixed",
         hide_index=True,
-        key="classification_editor",
+        key="stage_editor",
     )
-    st.session_state["classification_df"] = edited
+    st.session_state["stage_df"] = stage_edited
+
+    st.caption("Step 2: for each stage below, pick the specific sub-category. Suggestions are pre-filled where a sheet name matches one of that stage's categories.")
+
+    if "category_choices" not in st.session_state:
+        st.session_state["category_choices"] = {}
+    category_choices = st.session_state["category_choices"]
+
+    for stage in ("Input", "Process", "Output"):
+        stage_rows = stage_edited[stage_edited["Stage"] == stage]
+        st.markdown(f"#### {stage}")
+        if stage_rows.empty:
+            st.caption("No sheets assigned to this stage yet.")
+            continue
+
+        cat_rows = []
+        for _, r in stage_rows.iterrows():
+            key = (r["File"], r["Sheet"])
+            default = category_choices.get(key) or suggest_category_within_stage(r["Sheet"], stage) or "(Select)"
+            cat_rows.append({"File": r["File"], "Sheet": r["Sheet"], "Category": default})
+        cat_df = pd.DataFrame(cat_rows)
+
+        cat_edited = st.data_editor(
+            cat_df,
+            column_config={
+                "Category": st.column_config.SelectboxColumn(options=["(Select)"] + CATEGORY_TAXONOMY[stage], required=True),
+                "File": st.column_config.TextColumn(disabled=True),
+                "Sheet": st.column_config.TextColumn(disabled=True),
+            },
+            use_container_width=True,
+            num_rows="fixed",
+            hide_index=True,
+            key=f"category_editor_{stage}",
+        )
+        for _, r in cat_edited.iterrows():
+            category_choices[(r["File"], r["Sheet"])] = r["Category"]
 
     if st.button("Confirm Classification", type="primary"):
-        st.session_state["confirmed"] = {
-            (row["File"], row["Sheet"]): row["Category"] for _, row in edited.iterrows()
-        }
-        st.success(f"Locked in {len(st.session_state['confirmed'])} sheet classification(s).")
+        confirmed, unpicked = {}, 0
+        for _, r in stage_edited.iterrows():
+            key = (r["File"], r["Sheet"])
+            if r["Stage"] == UNCLASSIFIED:
+                continue
+            cat = category_choices.get(key, "(Select)")
+            if cat == "(Select)":
+                unpicked += 1
+                continue
+            confirmed[key] = cat
+        st.session_state["confirmed"] = confirmed
+        if unpicked:
+            st.warning(f"{unpicked} sheet(s) have a stage but no category picked yet - they'll be treated as unclassified until you pick one.")
+        st.success(f"Locked in {len(confirmed)} sheet classification(s).")
 
     if "confirmed" not in st.session_state:
         return
@@ -505,9 +667,6 @@ def main():
 
     st.divider()
     st.subheader("Flow Summary")
-
-    per_file_formulas = st.session_state["per_file_formulas"]
-    per_file_bounds = st.session_state["per_file_bounds"]
 
     combined_flow = {}
     for fname, formulas in per_file_formulas.items():
@@ -587,7 +746,10 @@ def main():
             "Links touching unclassified sheets": unclassified_ct,
             "Cross-file dependencies": len(xfile_edges),
         },
-        classification_df=edited,
+        classification_df=pd.DataFrame([
+            {"File": fname, "Sheet": sheet, "Stage": CATEGORY_TO_STAGE.get(cat, UNCLASSIFIED), "Category": cat}
+            for (fname, sheet), cat in confirmed.items()
+        ]),
         normal_rows=normal_rows,
         anomaly_rows=anomaly_rows,
         unclassified_rows=unclassified_rows,
@@ -603,7 +765,7 @@ def main():
     # -----------------------------------------------------------
     # Launch the full interactive visual - its own process, its own
     # local server, with the full feature set (click-to-open in Excel,
-    # search, show/hide panel). See lineage_flow_visual.py.
+    # search, show/hide panel). See flow_visual.py.
     # -----------------------------------------------------------
     st.divider()
     st.subheader("Interactive Flow Visual")
@@ -612,7 +774,7 @@ def main():
         "(classified sheets only) and a Full Flow (adds unclassified sheets and highlights anomalies)."
     )
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    visual_script_name = st.text_input("Flow visual script filename", value="lineage_flow_visual.py")
+    visual_script_name = st.text_input("Flow visual script filename", value="flow_visual.py")
     visual_script_path = os.path.join(script_dir, visual_script_name)
 
     if st.button("Open Interactive Flow Visual", type="primary"):
