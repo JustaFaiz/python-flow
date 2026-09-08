@@ -160,13 +160,11 @@ def suggest_category_within_stage(sheet_name, stage):
     return best
 
 
-def sheet_connectivity_stats(per_file_formulas, per_file_bounds, all_sheets):
-    """(fed_by_count, fed_into_count) per (file, sheet), from real
-    intra-file cross-sheet formula links - the structural half of the
-    suggestion signal."""
+def sheet_connectivity_stats(per_file_flow, all_sheets):
+    """(fed_by_count, fed_into_count) per (file, sheet), derived from the
+    already-computed per-file flow (no re-parsing)."""
     stats = {}
-    for fname, formulas in per_file_formulas.items():
-        flow = sheet_flow_within_file(formulas, per_file_bounds[fname])
+    for fname, flow in per_file_flow.items():
         fed_by, fed_into = {}, {}
         for (src, dst), _cnt in flow.items():
             fed_into.setdefault(src, set()).add(dst)
@@ -279,15 +277,31 @@ def load_workbook_formulas(path):
     return formulas, names, sheet_bounds
 
 
-def sheet_flow_within_file(formulas, sheet_bounds):
-    """(src_sheet, dst_sheet) -> cross-sheet formula cell count, within
-    ONE workbook."""
+def build_flow_and_arrows(formulas, sheet_bounds, min_cells=1):
+    """Returns (flow, precedent_cells, dependent_cells) for ONE workbook.
+    Same single pass produces everything downstream needs: the sheet-to-
+    sheet flow counts (for the rule check) AND the per-cell precedent/
+    dependent addresses (for the flow visual's Trace Precedents/
+    Dependents arrows in Excel) - computed once here, during the
+    already-parallelized Scan step, instead of a second time when the
+    flow visual launches."""
     flow = {}
-    for (sheet, _cell), f in formulas.items():
+    raw_refs = []
+    for (sheet, cell), f in formulas.items():
         refs = extract_refs(f, sheet, sheet_bounds)
-        for src in {s for s, c, is_range in refs if s != sheet}:
+        cross = [(s, c, is_range) for s, c, is_range in refs if s != sheet]
+        for src in {s for s, c, is_range in cross}:
             flow[(src, sheet)] = flow.get((src, sheet), 0) + 1
-    return flow
+        for src_sheet, src_cell, is_range in cross:
+            raw_refs.append((sheet, cell, src_sheet, src_cell))
+
+    precedent_cells, dependent_cells = {}, {}
+    for dst_sheet, dst_cell, src_sheet, src_cell in raw_refs:
+        if flow.get((src_sheet, dst_sheet), 0) < min_cells:
+            continue
+        precedent_cells.setdefault(dst_sheet, set()).add(dst_cell)
+        dependent_cells.setdefault(src_sheet, set()).add(src_cell)
+    return flow, precedent_cells, dependent_cells
 
 
 def extract_external_link_targets(path):
@@ -359,7 +373,9 @@ def cross_file_flow(file_paths, per_file_formulas):
 
 @st.cache_data(show_spinner=False)
 def scan_file_cached(path, fingerprint):
-    return load_workbook_formulas(path)
+    formulas, names, bounds = load_workbook_formulas(path)
+    flow, precedent_cells, dependent_cells = build_flow_and_arrows(formulas, bounds, min_cells=1)
+    return formulas, names, bounds, flow, precedent_cells, dependent_cells
 
 
 def fingerprint(path):
@@ -517,14 +533,18 @@ def main():
 
     if st.button("Scan", type="primary"):
         per_file_formulas, per_file_bounds, sheets_by_file = {}, {}, {}
+        per_file_flow, per_file_precedent, per_file_dependent = {}, {}, {}
         total = len(file_paths)
         prog = st.progress(0.0, text=f"Scanning 0/{total} file(s)...")
 
         # Each file is independent work (open, parse formulas via openpyxl/
-        # zipfile) and most of the time per file is disk I/O + XML parsing,
-        # both of which release the GIL - so a thread pool gives a real
-        # speedup here without process-pool spawn/pickling overhead, same
-        # approach the original batch folder scan used.
+        # zipfile, then derive flow + precedent/dependent cells) and most
+        # of the time per file is disk I/O + XML parsing, both of which
+        # release the GIL - so a thread pool gives a real speedup here
+        # without process-pool spawn/pickling overhead. Doing the flow/
+        # arrow analysis HERE (once, in parallel) is what lets the flow
+        # visual open almost instantly later instead of re-parsing every
+        # workbook from scratch a second time.
         max_workers = min(8, max(1, total))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             future_to_name = {
@@ -536,10 +556,13 @@ def main():
             for fut in concurrent.futures.as_completed(future_to_name):
                 fname = future_to_name[fut]
                 try:
-                    formulas, names, bounds = fut.result()
+                    formulas, names, bounds, flow, prec, dep = fut.result()
                     per_file_formulas[fname] = formulas
                     per_file_bounds[fname] = bounds
                     sheets_by_file[fname] = names
+                    per_file_flow[fname] = flow
+                    per_file_precedent[fname] = prec
+                    per_file_dependent[fname] = dep
                 except (PermissionError, OSError) as e:
                     # Most commonly: this exact file is open elsewhere right
                     # now (e.g. in Excel, via the flow visual's click-to-open)
@@ -564,10 +587,20 @@ def main():
         st.session_state["file_paths"] = file_paths
         st.session_state["per_file_formulas"] = per_file_formulas
         st.session_state["per_file_bounds"] = per_file_bounds
+        st.session_state["per_file_flow"] = per_file_flow
+        st.session_state["per_file_precedent"] = per_file_precedent
+        st.session_state["per_file_dependent"] = per_file_dependent
         st.session_state["all_sheets"] = all_sheets
         st.session_state.pop("stage_df", None)
         st.session_state.pop("category_choices", None)
         st.session_state.pop("confirmed", None)
+        # Also clear the data_editor widgets' own remembered state (keyed
+        # separately by Streamlit from our tracking dicts above) so a
+        # rescan with a different file/sheet set doesn't show leftover
+        # rows or values from the previous scan.
+        st.session_state.pop("stage_editor", None)
+        for k in [k for k in st.session_state if k.startswith("category_editor_")]:
+            st.session_state.pop(k, None)
 
     if "all_sheets" not in st.session_state:
         return
@@ -576,6 +609,7 @@ def main():
     multi_file = len(st.session_state["file_paths"]) > 1
     per_file_formulas = st.session_state["per_file_formulas"]
     per_file_bounds = st.session_state["per_file_bounds"]
+    per_file_flow = st.session_state["per_file_flow"]
     st.success(f"{len(all_sheets)} sheet(s) across {len(st.session_state['file_paths'])} file(s).")
 
     st.divider()
@@ -586,7 +620,7 @@ def main():
         "like a Process, one that only receives looks like an Output."
     )
 
-    sheet_stats = sheet_connectivity_stats(per_file_formulas, per_file_bounds, all_sheets)
+    sheet_stats = sheet_connectivity_stats(per_file_flow, all_sheets)
 
     if "stage_df" not in st.session_state:
         rows = []
@@ -629,6 +663,18 @@ def main():
             cat_rows.append({"File": r["File"], "Sheet": r["Sheet"], "Category": default})
         cat_df = pd.DataFrame(cat_rows)
 
+        # The widget key includes exactly which sheets currently sit in
+        # this stage. Streamlit remembers a data_editor's state by its
+        # key, not by the dataframe you pass it - so with a fixed key,
+        # moving a sheet between stages changed the row set but the
+        # widget kept serving its old cached state instead of picking up
+        # the move, which is why edits weren't propagating. Changing the
+        # key whenever the row set changes forces a fresh widget; no
+        # picks are lost since they live in category_choices, not in the
+        # widget's own state.
+        row_signature = hash(tuple(sorted((r["File"], r["Sheet"]) for _, r in stage_rows.iterrows())))
+        editor_key = f"category_editor_{stage}_{row_signature}"
+
         cat_edited = st.data_editor(
             cat_df,
             column_config={
@@ -639,26 +685,32 @@ def main():
             use_container_width=True,
             num_rows="fixed",
             hide_index=True,
-            key=f"category_editor_{stage}",
+            key=editor_key,
         )
         for _, r in cat_edited.iterrows():
             category_choices[(r["File"], r["Sheet"])] = r["Category"]
 
+    pending = {}
+    for _, r in stage_edited.iterrows():
+        key = (r["File"], r["Sheet"])
+        if r["Stage"] == UNCLASSIFIED:
+            continue
+        cat = category_choices.get(key, "(Select)")
+        if cat != "(Select)":
+            pending[key] = cat
+
+    if st.session_state.get("confirmed") is not None and pending != st.session_state["confirmed"]:
+        st.warning("You've changed the classification since it was last confirmed. Click **Confirm Classification** to update the Flow Summary, Report, and Visual below.")
+
     if st.button("Confirm Classification", type="primary"):
-        confirmed, unpicked = {}, 0
-        for _, r in stage_edited.iterrows():
-            key = (r["File"], r["Sheet"])
-            if r["Stage"] == UNCLASSIFIED:
-                continue
-            cat = category_choices.get(key, "(Select)")
-            if cat == "(Select)":
-                unpicked += 1
-                continue
-            confirmed[key] = cat
-        st.session_state["confirmed"] = confirmed
+        unpicked = sum(
+            1 for _, r in stage_edited.iterrows()
+            if r["Stage"] != UNCLASSIFIED and category_choices.get((r["File"], r["Sheet"]), "(Select)") == "(Select)"
+        )
+        st.session_state["confirmed"] = pending
         if unpicked:
             st.warning(f"{unpicked} sheet(s) have a stage but no category picked yet - they'll be treated as unclassified until you pick one.")
-        st.success(f"Locked in {len(confirmed)} sheet classification(s).")
+        st.success(f"Locked in {len(pending)} sheet classification(s).")
 
     if "confirmed" not in st.session_state:
         return
@@ -669,8 +721,8 @@ def main():
     st.subheader("Flow Summary")
 
     combined_flow = {}
-    for fname, formulas in per_file_formulas.items():
-        for (src, dst), cnt in sheet_flow_within_file(formulas, per_file_bounds[fname]).items():
+    for fname, flow in per_file_flow.items():
+        for (src, dst), cnt in flow.items():
             combined_flow[(node_id(fname, src), node_id(fname, dst))] = cnt
 
     def stage_of(nid):
@@ -781,8 +833,24 @@ def main():
         if not os.path.exists(visual_script_path):
             st.error(f"Couldn't find {visual_script_name} in {script_dir}. Make sure it's saved in the same folder as this dashboard.")
         else:
+            # Hand off everything already computed during Scan - sheet
+            # names, per-sheet flow, and precedent/dependent cell
+            # addresses - so the visual does zero re-parsing of the
+            # workbook(s) on launch, no matter how many sheets there are.
+            per_file_precedent = st.session_state["per_file_precedent"]
+            per_file_dependent = st.session_state["per_file_dependent"]
+            per_file_bounds = st.session_state["per_file_bounds"]
+            file_data = {}
+            for fname in st.session_state["file_paths"]:
+                file_data[fname] = {
+                    "sheet_names": list(per_file_bounds[fname].keys()),
+                    "flow": [[src, dst, cnt] for (src, dst), cnt in per_file_flow.get(fname, {}).items()],
+                    "precedent_cells": {s: sorted(c) for s, c in per_file_precedent.get(fname, {}).items()},
+                    "dependent_cells": {s: sorted(c) for s, c in per_file_dependent.get(fname, {}).items()},
+                }
             handoff = {
                 "files": st.session_state["file_paths"],
+                "file_data": file_data,
                 "classification": {
                     f"{fname}::{sheet}": {"stage": CATEGORY_TO_STAGE.get(cat, UNCLASSIFIED), "category": cat}
                     for (fname, sheet), cat in confirmed.items()
