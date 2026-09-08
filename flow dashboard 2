@@ -1,0 +1,637 @@
+"""
+lineage_dashboard.py
+----------------------
+Streamlit dashboard: classify every sheet - across one workpaper, or every
+workbook in an entity's folder - into a FIXED Input / Process / Output
+category taxonomy, then draw the real sheet-to-sheet formula flow with a
+hard rule enforced:
+
+    Input   -> Input   or Process
+    Process -> Process or Output
+
+Any real formula link that breaks this rule (Process -> Input, Output ->
+anything, a link touching a sheet nobody has classified yet, etc.) is drawn
+as a flagged ANOMALY edge instead of being hidden or silently allowed, and
+listed in its own table underneath the diagram.
+
+Requires:
+    pip install streamlit openpyxl pandas
+
+Usage:
+    streamlit run lineage_dashboard.py
+"""
+
+import concurrent.futures
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import zipfile
+import xml.etree.ElementTree as ET
+
+import pandas as pd
+import streamlit as st
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter, column_index_from_string
+
+# =================================================================
+# 1. FIXED CATEGORY TAXONOMY - edit this block to change categories.
+#    Every category belongs to exactly one stage. Pick a category in
+#    the UI and the stage comes along with it automatically.
+# =================================================================
+
+CATEGORY_TAXONOMY = {
+    "Input": [
+        "SAP/BW Reports", "S4 GR", "ERS", "SAC Reports", "TDRTs", "KAS",
+        "TMN02", "Non TMN02", "List of Elections", "Legal Entity Info",
+        "Tax Law", "Tax Regulation",
+    ],
+    "Process": [
+        "Excel Workpapers", "Corptax", "Longview", "UTA", "DTTU", "SODA",
+        "TARS", "BNA/SAP Tangibles", "BNA Workpapers", "PTMS",
+    ],
+    "Output": [
+        "Annual Federal Tax Returns", "Multi-State Tax Returns",
+        "Property Tax Returns/Payments", "Federal/State Audit Requirements",
+        "Quarterly Estimated Filings", "Extension Filings", "Tax Payments",
+        "Tax Provision", "Group Reporting Requirements", "Dep Notices",
+        "Tax Advisory",
+    ],
+}
+
+UNCLASSIFIED = "(Unclassified)"
+CATEGORY_TO_STAGE = {c: stage for stage, cats in CATEGORY_TAXONOMY.items() for c in cats}
+ALL_CATEGORIES = [UNCLASSIFIED] + [c for cats in CATEGORY_TAXONOMY.values() for c in cats]
+
+# Lowercase substring keyword hints used to PRE-FILL a guess per sheet name.
+# You always review/override these before confirming - add more as you
+# learn the naming conventions in your own workbooks.
+CATEGORY_KEYWORDS = {
+    "SAP/BW Reports": ["sap", "bw report"],
+    "S4 GR": ["s4", "s/4", " gr"],
+    "ERS": ["ers"],
+    "SAC Reports": ["sac"],
+    "TDRTs": ["tdrt"],
+    "KAS": ["kas"],
+    "TMN02": ["tmn02", "tmn 02"],
+    "Non TMN02": ["non tmn", "non-tmn"],
+    "List of Elections": ["election"],
+    "Legal Entity Info": ["legal entity", "entity info", "entity list"],
+    "Tax Law": ["tax law"],
+    "Tax Regulation": ["regulation", "reg update"],
+    "Excel Workpapers": ["workpaper", " wp"],
+    "Corptax": ["corptax"],
+    "Longview": ["longview", "lv "],
+    "UTA": ["uta"],
+    "DTTU": ["dttu"],
+    "SODA": ["soda"],
+    "TARS": ["tars"],
+    "BNA/SAP Tangibles": ["tangible", "bna sap"],
+    "BNA Workpapers": ["bna"],
+    "PTMS": ["ptms"],
+    "Annual Federal Tax Returns": ["federal return", "1120", "annual federal"],
+    "Multi-State Tax Returns": ["state return", "multi-state", "multistate"],
+    "Property Tax Returns/Payments": ["property tax"],
+    "Federal/State Audit Requirements": ["audit"],
+    "Quarterly Estimated Filings": ["estimate", "quarterly"],
+    "Extension Filings": ["extension"],
+    "Tax Payments": ["payment"],
+    "Tax Provision": ["provision"],
+    "Group Reporting Requirements": ["group report"],
+    "Dep Notices": ["dep notice", "notice"],
+    "Tax Advisory": ["advisory"],
+}
+
+
+def suggest_category(sheet_name):
+    name = sheet_name.lower()
+    best, best_score = UNCLASSIFIED, 0
+    for cat, kws in CATEGORY_KEYWORDS.items():
+        score = sum(1 for kw in kws if kw in name)
+        if score > best_score:
+            best, best_score = cat, score
+    return best
+
+
+# =================================================================
+# 2. FLOW RULES
+# =================================================================
+
+ALLOWED_STAGE_TRANSITIONS = {
+    ("Input", "Input"),
+    ("Input", "Process"),
+    ("Process", "Process"),
+    ("Process", "Output"),
+}
+
+STAGE_COLOR = {
+    "Input": "#2ecc71",
+    "Process": "#2a9d8f",
+    "Output": "#f39c12",
+    UNCLASSIFIED: "#7f8c8d",
+}
+STAGE_LEVEL = {"Input": 0, "Process": 1, "Output": 2, UNCLASSIFIED: 3}
+
+
+# =================================================================
+# 3. FORMULA PARSING (same regex approach used across the existing
+#    health-check / sheet-tree tools, condensed here)
+# =================================================================
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+COLUMN_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?([A-Z]{1,3})\$?:\$?([A-Z]{1,3})\$?(?![A-Za-z0-9_])"
+)
+ROW_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?(\d{1,7})\$?:\$?(\d{1,7})\$?(?![A-Za-z0-9_])"
+)
+FULL_RANGE_ROW_CAP = 5000
+FULL_RANGE_COL_CAP = 200
+
+EXTERNAL_REF_RE = re.compile(r"'\[(\d+)\][^'!]*'!" r"|\[(\d+)\][A-Za-z_][A-Za-z0-9_.]*!")
+_MAIN_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_PKG_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+
+def _spans_overlap(span, others):
+    s0, s1 = span
+    return any(s0 < a1 and a0 < s1 for a0, a1 in others)
+
+
+def extract_refs(formula, current_sheet, sheet_bounds):
+    """Returns [(sheet, cell, is_range)]. For any range, only the first
+    and last cell are returned - not every cell in between."""
+    refs, spans = [], []
+    for m in CELL_REF_RE.finditer(formula):
+        spans.append(m.span())
+        sheet = m.group(1) or m.group(2) or current_sheet
+        c1 = m.group(3).replace('$', '')
+        c2 = m.group(4)
+        if c2:
+            refs.append((sheet, c1, True))
+            refs.append((sheet, c2.replace('$', ''), True))
+        else:
+            refs.append((sheet, c1, False))
+    for m in COLUMN_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        c1, c2 = column_index_from_string(m.group(3)), column_index_from_string(m.group(4))
+        if c1 > c2:
+            c1, c2 = c2, c1
+        max_row = min(sheet_bounds.get(sheet, (FULL_RANGE_ROW_CAP, 1))[0], FULL_RANGE_ROW_CAP) or 1
+        refs.append((sheet, f"{get_column_letter(c1)}1", True))
+        refs.append((sheet, f"{get_column_letter(c2)}{max_row}", True))
+    for m in ROW_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        r1, r2 = int(m.group(3)), int(m.group(4))
+        if r1 > r2:
+            r1, r2 = r2, r1
+        max_col = min(sheet_bounds.get(sheet, (1, FULL_RANGE_COL_CAP))[1], FULL_RANGE_COL_CAP) or 1
+        refs.append((sheet, f"A{r1}", True))
+        refs.append((sheet, f"{get_column_letter(max_col)}{r2}", True))
+    return refs
+
+
+def load_workbook_formulas(path):
+    wb = load_workbook(path, data_only=False, read_only=True)
+    formulas, sheet_bounds = {}, {}
+    for ws in wb.worksheets:
+        max_row, max_col = ws.max_row or 1, ws.max_column or 1
+        sheet_bounds[ws.title] = (max_row, max_col)
+        for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col), start=1):
+            for c_idx, cell in enumerate(row, start=1):
+                if isinstance(cell.value, str) and cell.value.startswith('='):
+                    formulas[(ws.title, f"{get_column_letter(c_idx)}{r_idx}")] = cell.value
+    names = wb.sheetnames
+    wb.close()
+    return formulas, names, sheet_bounds
+
+
+def sheet_flow_within_file(formulas, sheet_bounds):
+    """(src_sheet, dst_sheet) -> cross-sheet formula cell count, within
+    ONE workbook."""
+    flow = {}
+    for (sheet, _cell), f in formulas.items():
+        refs = extract_refs(f, sheet, sheet_bounds)
+        for src in {s for s, c, is_range in refs if s != sheet}:
+            flow[(src, sheet)] = flow.get((src, sheet), 0) + 1
+    return flow
+
+
+def extract_external_link_targets(path):
+    """Resolves Excel's [N] external-workbook index (as seen in a formula
+    like '[1]Sheet1'!A1) to the real external FILE NAME it points to, by
+    walking the xlsx's own zip/XML relationship chain."""
+    targets = {}
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            if "xl/workbook.xml" not in names or "xl/_rels/workbook.xml.rels" not in names:
+                return targets
+            wb_root = ET.parse(z.open("xl/workbook.xml")).getroot()
+            rids = [er.get(f"{_R_NS}id") for er in wb_root.findall(
+                f".//{_MAIN_NS}externalReferences/{_MAIN_NS}externalReference")]
+            if not rids:
+                return targets
+            rels_root = ET.parse(z.open("xl/_rels/workbook.xml.rels")).getroot()
+            rid_to_target = {rel.get("Id"): rel.get("Target")
+                              for rel in rels_root.findall(f"{_PKG_NS}Relationship")}
+            for idx, rid in enumerate(rids, start=1):
+                link_target = rid_to_target.get(rid)
+                if not link_target:
+                    continue
+                link_rels_path = f"xl/externalLinks/_rels/{os.path.basename(link_target)}.rels"
+                if link_rels_path not in names:
+                    continue
+                link_rels_root = ET.parse(z.open(link_rels_path)).getroot()
+                for rel in link_rels_root.findall(f"{_PKG_NS}Relationship"):
+                    tgt = rel.get("Target", "")
+                    if tgt:
+                        targets[idx] = os.path.basename(urllib.parse.unquote(tgt).replace("\\", "/"))
+                        break
+    except Exception:
+        pass
+    return targets
+
+
+def cross_file_flow(file_paths, per_file_formulas):
+    """Returns {(src_file, dst_file): formula_cell_count} - FILE-level
+    only (Excel's own external-link syntax doesn't reliably expose which
+    sheet on the source side it came from, so this stays file-to-file,
+    shown separately from the sheet-level flow/anomaly rules)."""
+    by_stem = {}
+    for name in file_paths:
+        by_stem.setdefault(os.path.splitext(name)[0].lower(), []).append(name)
+
+    edges = {}
+    for fname, fpath in file_paths.items():
+        targets = extract_external_link_targets(fpath)
+        if not targets:
+            continue
+        for (_sheet, _cell), f in per_file_formulas.get(fname, {}).items():
+            for m in EXTERNAL_REF_RE.finditer(f):
+                idx = int(m.group(1) or m.group(2))
+                ext_name = targets.get(idx)
+                if not ext_name:
+                    continue
+                match = ext_name if ext_name in file_paths else None
+                if not match:
+                    cands = by_stem.get(os.path.splitext(ext_name)[0].lower(), [])
+                    if len(cands) == 1:
+                        match = cands[0]
+                if not match or match == fname:
+                    continue
+                edges[(match, fname)] = edges.get((match, fname), 0) + 1
+    return edges
+
+
+@st.cache_data(show_spinner=False)
+def scan_file_cached(path, fingerprint):
+    return load_workbook_formulas(path)
+
+
+def fingerprint(path):
+    st_ = os.stat(path)
+    return (st_.st_mtime, st_.st_size)
+
+
+def node_id(fname, sheet):
+    return f"{fname}::{sheet}"
+
+
+# =================================================================
+# Excel export - every dashboard section becomes its own tab in one
+# workbook, so the whole review can be handed off as a single file.
+# =================================================================
+
+def _write_table_sheet(wb, title, rows, headers=None):
+    ws = wb.create_sheet(title=title[:31])  # Excel sheet name cap
+    if not rows:
+        ws.append(["(none)"])
+        return
+    headers = headers or list(rows[0].keys())
+    ws.append(headers)
+    for i in range(1, len(headers) + 1):
+        ws.cell(row=1, column=i).font = Font(bold=True)
+    for row in rows:
+        ws.append([row.get(h, "") for h in headers])
+    widths = [max(12, min(45, max(len(str(h)), *(len(str(r.get(h, ""))) for r in rows)) + 2)) for h in headers]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+
+
+def build_report_workbook_bytes(summary, classification_df, normal_rows, anomaly_rows, unclassified_rows, xfile_rows):
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    ws = wb.create_sheet(title="Summary")
+    ws.append(["Metric", "Value"])
+    ws.cell(row=1, column=1).font = Font(bold=True)
+    ws.cell(row=1, column=2).font = Font(bold=True)
+    for k, v in summary.items():
+        ws.append([k, v])
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 14
+
+    ws2 = wb.create_sheet(title="Classification")
+    cols = list(classification_df.columns)
+    ws2.append(cols)
+    for i in range(1, len(cols) + 1):
+        ws2.cell(row=1, column=i).font = Font(bold=True)
+    for _, row in classification_df.iterrows():
+        ws2.append([row[c] for c in cols])
+    for i, c in enumerate(cols, start=1):
+        ws2.column_dimensions[get_column_letter(i)].width = 30
+    ws2.freeze_panes = "A2"
+
+    _write_table_sheet(wb, "Normal Links", normal_rows)
+    _write_table_sheet(wb, "Anomalies", anomaly_rows)
+    _write_table_sheet(wb, "Unclassified Links", unclassified_rows)
+    _write_table_sheet(wb, "Cross-File Dependencies", xfile_rows)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# =================================================================
+# STREAMLIT UI
+#    The interactive flow visual itself lives in lineage_flow_visual.py,
+#    a separate standalone script launched as its own local-server
+#    process (same pattern as the original Sheet_Trace_Visual /
+#    sheet_tree_server.py split) - this keeps the dashboard itself fast
+#    and focused on scanning + classification, and gives the visual the
+#    full feature set (click-to-open in Excel, search, show/hide panel)
+#    without that overhead running inside every Streamlit rerun.
+# =================================================================
+
+def main():
+    st.set_page_config(page_title="Data Lineage Flow Classifier", layout="wide")
+    st.title("Data Lineage Flow Classifier")
+    st.caption(
+        "Classify every sheet into a fixed Input / Process / Output category, then see the real "
+        "formula-flow between sheets. Expected flow: Input -> Input/Process, Process -> Process/Output. "
+        "Anything else is flagged as an anomaly instead of hidden."
+    )
+
+    mode = st.radio("Scope", ["Single workpaper", "Folder (entity - multiple workbooks)"], horizontal=True)
+
+    file_paths = {}
+    tmp_dir = tempfile.gettempdir()
+
+    if mode == "Single workpaper":
+        uploaded = st.file_uploader("Drop your .xlsx / .xlsm workbook", type=["xlsx", "xlsm"])
+        if uploaded is not None:
+            path = os.path.join(tmp_dir, uploaded.name)
+            with open(path, "wb") as f:
+                f.write(uploaded.getbuffer())
+            file_paths[uploaded.name] = path
+    else:
+        folder = st.text_input("Folder path containing this entity's workbooks")
+        include_sub = st.checkbox("Include subfolders", value=False)
+        if folder and os.path.isdir(folder):
+            if include_sub:
+                for root, _d, files in os.walk(folder):
+                    for fn in files:
+                        if fn.lower().endswith((".xlsx", ".xlsm")):
+                            file_paths.setdefault(fn, os.path.join(root, fn))
+            else:
+                for fn in sorted(os.listdir(folder)):
+                    if fn.lower().endswith((".xlsx", ".xlsm")):
+                        file_paths[fn] = os.path.join(folder, fn)
+            if not file_paths:
+                st.warning("No .xlsx/.xlsm files found in that folder.")
+        elif folder:
+            st.warning("That folder path doesn't exist.")
+
+    if not file_paths:
+        st.info("Provide a workbook (or folder) to begin.")
+        return
+
+    if st.button("Scan", type="primary"):
+        per_file_formulas, per_file_bounds, sheets_by_file = {}, {}, {}
+        total = len(file_paths)
+        prog = st.progress(0.0, text=f"Scanning 0/{total} file(s)...")
+
+        # Each file is independent work (open, parse formulas via openpyxl/
+        # zipfile) and most of the time per file is disk I/O + XML parsing,
+        # both of which release the GIL - so a thread pool gives a real
+        # speedup here without process-pool spawn/pickling overhead, same
+        # approach the original batch folder scan used.
+        max_workers = min(8, max(1, total))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_name = {
+                pool.submit(scan_file_cached, fpath, fingerprint(fpath)): fname
+                for fname, fpath in file_paths.items()
+            }
+            done = 0
+            for fut in concurrent.futures.as_completed(future_to_name):
+                fname = future_to_name[fut]
+                formulas, names, bounds = fut.result()
+                per_file_formulas[fname] = formulas
+                per_file_bounds[fname] = bounds
+                sheets_by_file[fname] = names
+                done += 1
+                prog.progress(done / total, text=f"Scanning {done}/{total} file(s)...")
+        prog.empty()
+
+        # Rebuilt in original file order (as_completed finishes out of
+        # order) so the classification table below lists consistently.
+        all_sheets = [(fname, s) for fname in file_paths for s in sheets_by_file[fname]]
+
+        st.session_state["file_paths"] = file_paths
+        st.session_state["per_file_formulas"] = per_file_formulas
+        st.session_state["per_file_bounds"] = per_file_bounds
+        st.session_state["all_sheets"] = all_sheets
+        st.session_state.pop("classification_df", None)
+        st.session_state.pop("confirmed", None)
+
+    if "all_sheets" not in st.session_state:
+        return
+
+    all_sheets = st.session_state["all_sheets"]
+    multi_file = len(st.session_state["file_paths"]) > 1
+    st.success(f"{len(all_sheets)} sheet(s) across {len(st.session_state['file_paths'])} file(s).")
+
+    st.divider()
+    st.subheader("Classify each sheet")
+    st.caption("Categories come from the fixed taxonomy at the top of this script - edit CATEGORY_TAXONOMY to change them. Suggestions are pre-filled from sheet-name keywords; review before confirming.")
+
+    if "classification_df" not in st.session_state:
+        rows = [{"File": fname, "Sheet": sheet, "Category": suggest_category(sheet)}
+                for fname, sheet in all_sheets]
+        st.session_state["classification_df"] = pd.DataFrame(rows)
+
+    edited = st.data_editor(
+        st.session_state["classification_df"],
+        column_config={
+            "Category": st.column_config.SelectboxColumn(options=ALL_CATEGORIES, required=True, width="medium"),
+            "File": st.column_config.TextColumn(disabled=True),
+            "Sheet": st.column_config.TextColumn(disabled=True),
+        },
+        use_container_width=True,
+        num_rows="fixed",
+        hide_index=True,
+        key="classification_editor",
+    )
+    st.session_state["classification_df"] = edited
+
+    if st.button("Confirm Classification", type="primary"):
+        st.session_state["confirmed"] = {
+            (row["File"], row["Sheet"]): row["Category"] for _, row in edited.iterrows()
+        }
+        st.success(f"Locked in {len(st.session_state['confirmed'])} sheet classification(s).")
+
+    if "confirmed" not in st.session_state:
+        return
+
+    confirmed = st.session_state["confirmed"]
+
+    st.divider()
+    st.subheader("Flow Summary")
+
+    per_file_formulas = st.session_state["per_file_formulas"]
+    per_file_bounds = st.session_state["per_file_bounds"]
+
+    combined_flow = {}
+    for fname, formulas in per_file_formulas.items():
+        for (src, dst), cnt in sheet_flow_within_file(formulas, per_file_bounds[fname]).items():
+            combined_flow[(node_id(fname, src), node_id(fname, dst))] = cnt
+
+    def stage_of(nid):
+        fname, sheet = nid.split("::", 1)
+        return CATEGORY_TO_STAGE.get(confirmed.get((fname, sheet), UNCLASSIFIED), UNCLASSIFIED)
+
+    def label_of(nid):
+        fname, sheet = nid.split("::", 1)
+        return f"{sheet} ({fname})" if multi_file else sheet
+
+    normal_ct = anomaly_ct = unclassified_ct = 0
+    normal_rows, anomaly_rows, unclassified_rows = [], [], []
+    for (src, dst), cnt in combined_flow.items():
+        s_stage, d_stage = stage_of(src), stage_of(dst)
+        if s_stage == UNCLASSIFIED or d_stage == UNCLASSIFIED:
+            unclassified_ct += 1
+            unclassified_rows.append({"From": label_of(src), "To": label_of(dst), "Formula Cells": cnt})
+        elif (s_stage, d_stage) in ALLOWED_STAGE_TRANSITIONS:
+            normal_ct += 1
+            normal_rows.append({"From": label_of(src), "From Stage": s_stage, "To": label_of(dst),
+                                 "To Stage": d_stage, "Formula Cells": cnt})
+        else:
+            anomaly_ct += 1
+            anomaly_rows.append({"From": label_of(src), "From Stage": s_stage, "To": label_of(dst),
+                                  "To Stage": d_stage, "Formula Cells": cnt})
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Normal links", normal_ct)
+    c2.metric("Anomalies (rule broken)", anomaly_ct)
+    c3.metric("Links touching unclassified sheets", unclassified_ct)
+
+    if anomaly_rows:
+        st.subheader(f"Anomalies ({len(anomaly_rows)})")
+        st.caption("These formula links go against the expected Input -> Process -> Output direction.")
+        st.dataframe(anomaly_rows, use_container_width=True)
+
+    if unclassified_rows:
+        with st.expander(f"Links touching unclassified sheets ({len(unclassified_rows)})"):
+            st.dataframe(unclassified_rows, use_container_width=True)
+
+    if multi_file:
+        xfile_edges = cross_file_flow(st.session_state["file_paths"], per_file_formulas)
+        st.subheader(f"Cross-File Dependencies ({len(xfile_edges)})")
+        st.caption(
+            "Files that reference each other directly via an external-workbook formula link - shown at the "
+            "file level (Excel's own link format doesn't reliably expose the source sheet)."
+        )
+        if xfile_edges:
+            st.dataframe(
+                [{"From File": s, "To File": d, "Formula Cells": c} for (s, d), c in xfile_edges.items()],
+                use_container_width=True,
+            )
+        else:
+            st.write("No direct external-workbook formula links found between files in this folder.")
+    else:
+        xfile_edges = {}
+
+    # -----------------------------------------------------------
+    # Download everything as one Excel workbook - one dashboard
+    # section per tab.
+    # -----------------------------------------------------------
+    st.divider()
+    st.subheader("Download Full Report (.xlsx)")
+    st.caption("Every section above as its own tab in one workbook: Summary, Classification, Normal Links, Anomalies, Unclassified Links, Cross-File Dependencies.")
+
+    report_bytes = build_report_workbook_bytes(
+        summary={
+            "Files scanned": len(st.session_state["file_paths"]),
+            "Sheets scanned": len(all_sheets),
+            "Sheets classified": len(confirmed),
+            "Normal links": normal_ct,
+            "Anomalies (rule broken)": anomaly_ct,
+            "Links touching unclassified sheets": unclassified_ct,
+            "Cross-file dependencies": len(xfile_edges),
+        },
+        classification_df=edited,
+        normal_rows=normal_rows,
+        anomaly_rows=anomaly_rows,
+        unclassified_rows=unclassified_rows,
+        xfile_rows=[{"From File": s, "To File": d, "Formula Cells": c} for (s, d), c in xfile_edges.items()],
+    )
+    st.download_button(
+        "Download Report (.xlsx)",
+        data=report_bytes,
+        file_name="lineage_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    # -----------------------------------------------------------
+    # Launch the full interactive visual - its own process, its own
+    # local server, with the full feature set (click-to-open in Excel,
+    # search, show/hide panel). See lineage_flow_visual.py.
+    # -----------------------------------------------------------
+    st.divider()
+    st.subheader("Interactive Flow Visual")
+    st.caption(
+        "Opens in your browser via a separate local process, with two views to toggle between: a Clean Flow "
+        "(classified sheets only) and a Full Flow (adds unclassified sheets and highlights anomalies)."
+    )
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    visual_script_name = st.text_input("Flow visual script filename", value="lineage_flow_visual.py")
+    visual_script_path = os.path.join(script_dir, visual_script_name)
+
+    if st.button("Open Interactive Flow Visual", type="primary"):
+        if not os.path.exists(visual_script_path):
+            st.error(f"Couldn't find {visual_script_name} in {script_dir}. Make sure it's saved in the same folder as this dashboard.")
+        else:
+            handoff = {
+                "files": st.session_state["file_paths"],
+                "classification": {
+                    f"{fname}::{sheet}": {"stage": CATEGORY_TO_STAGE.get(cat, UNCLASSIFIED), "category": cat}
+                    for (fname, sheet), cat in confirmed.items()
+                },
+            }
+            handoff_path = os.path.join(tmp_dir, "lineage_handoff.json")
+            with open(handoff_path, "w", encoding="utf-8") as f:
+                json.dump(handoff, f)
+            subprocess.Popen([sys.executable, visual_script_path, handoff_path])
+            st.success(f"Launched {visual_script_name} - check your browser for a new tab.")
+
+
+if __name__ == "__main__":
+    main()
