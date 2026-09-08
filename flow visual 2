@@ -1,0 +1,795 @@
+"""
+lineage_flow_visual.py
+------------------------
+Standalone interactive flow visual - launched as its own process by
+lineage_dashboard.py (same split as the original health_check.py /
+Sheet_Trace_Visual_6.py / sheet_tree_server.py architecture).
+
+Reads a small handoff JSON (file paths + confirmed stage/category per
+sheet), re-parses formulas itself, builds the sheet-to-sheet flow graph,
+and serves an interactive vis-network page:
+
+  - Nodes colored by stage (Input / Process / Output / Unclassified),
+    positioned in columns left -> right.
+  - Edges: gray = normal (follows Input->Input/Process, Process->
+    Process/Output), red dashed = ANOMALY (breaks that rule), purple
+    dashed = touches an unclassified sheet.
+  - Click a sheet box -> actually switches to that sheet in Excel via
+    pywin32 COM automation (same mechanism VBA macros use) and draws
+    Trace Precedents / Trace Dependents arrows on it.
+  - Search box, right-click to hide/show a node, a show/hide panel with
+    Show all / Hide all / Undo.
+
+Requires:
+    pip install openpyxl pywin32
+    Excel must be installed for the click-to-open feature.
+
+Usage:
+    python lineage_flow_visual.py lineage_handoff.json
+"""
+
+import json
+import os
+import re
+import sys
+import threading
+import time
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter, column_index_from_string
+
+DEFAULT_MIN_CELLS = 1
+PORT = 0  # 0 = let the OS pick a free port
+
+UNCLASSIFIED = "(Unclassified)"
+ALLOWED_STAGE_TRANSITIONS = {
+    ("Input", "Input"), ("Input", "Process"),
+    ("Process", "Process"), ("Process", "Output"),
+}
+STAGE_COLOR = {
+    "Input": "#2ecc71", "Process": "#2a9d8f", "Output": "#f39c12",
+    UNCLASSIFIED: "#7f8c8d",
+}
+STAGE_LEVEL = {"Input": 0, "Process": 1, "Output": 2, UNCLASSIFIED: 3}
+
+# Full-flow view uses a simplified 2-color scheme (per the request: the
+# classified flow "in one colour" plus the missed sheets in another)
+# instead of the 4-way stage coloring - the point of that view is
+# classified vs. not, not which stage.
+FULL_CLASSIFIED_COLOR = "#4dabf7"
+FULL_UNCLASSIFIED_COLOR = "#7f8c8d"
+
+# ---------------------------------------------------------------
+# Formula parsing (identical approach to lineage_dashboard.py / the
+# original health_check.py + sheet_tree_server.py)
+# ---------------------------------------------------------------
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+COLUMN_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?([A-Z]{1,3})\$?:\$?([A-Z]{1,3})\$?(?![A-Za-z0-9_])"
+)
+ROW_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?(\d{1,7})\$?:\$?(\d{1,7})\$?(?![A-Za-z0-9_])"
+)
+FULL_RANGE_ROW_CAP = 5000
+FULL_RANGE_COL_CAP = 200
+MAX_FORMULAS_LISTED = 50
+
+
+def _spans_overlap(span, others):
+    s0, s1 = span
+    return any(s0 < a1 and a0 < s1 for a0, a1 in others)
+
+
+def extract_refs(formula, current_sheet, sheet_bounds):
+    refs, spans = [], []
+    for m in CELL_REF_RE.finditer(formula):
+        spans.append(m.span())
+        sheet = m.group(1) or m.group(2) or current_sheet
+        c1 = m.group(3).replace('$', '')
+        c2 = m.group(4)
+        if c2:
+            refs.append((sheet, c1, True))
+            refs.append((sheet, c2.replace('$', ''), True))
+        else:
+            refs.append((sheet, c1, False))
+    for m in COLUMN_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        c1, c2 = column_index_from_string(m.group(3)), column_index_from_string(m.group(4))
+        if c1 > c2:
+            c1, c2 = c2, c1
+        max_row = min(sheet_bounds.get(sheet, (FULL_RANGE_ROW_CAP, 1))[0], FULL_RANGE_ROW_CAP) or 1
+        refs.append((sheet, f"{get_column_letter(c1)}1", True))
+        refs.append((sheet, f"{get_column_letter(c2)}{max_row}", True))
+    for m in ROW_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        r1, r2 = int(m.group(3)), int(m.group(4))
+        if r1 > r2:
+            r1, r2 = r2, r1
+        max_col = min(sheet_bounds.get(sheet, (1, FULL_RANGE_COL_CAP))[1], FULL_RANGE_COL_CAP) or 1
+        refs.append((sheet, f"A{r1}", True))
+        refs.append((sheet, f"{get_column_letter(max_col)}{r2}", True))
+    return refs
+
+
+def load_formulas(path):
+    wb = load_workbook(path, data_only=False, read_only=True)
+    formulas, sheet_bounds = {}, {}
+    for ws in wb.worksheets:
+        max_row, max_col = ws.max_row or 1, ws.max_column or 1
+        sheet_bounds[ws.title] = (max_row, max_col)
+        for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col), start=1):
+            for c_idx, cell in enumerate(row, start=1):
+                if isinstance(cell.value, str) and cell.value.startswith('='):
+                    formulas[(ws.title, f"{get_column_letter(c_idx)}{r_idx}")] = cell.value
+    names = wb.sheetnames
+    wb.close()
+    return formulas, names, sheet_bounds
+
+
+def build_flow_and_arrows(formulas, sheet_bounds, min_cells):
+    """Returns (flow, precedent_cells, dependent_cells) for ONE workbook -
+    same shape/semantics as the original sheet_tree_server.py, used both
+    for the diagram edges and for the Trace Precedents/Dependents arrows
+    drawn in Excel on click."""
+    flow = {}
+    raw_refs = []
+    for (sheet, cell), f in formulas.items():
+        refs = extract_refs(f, sheet, sheet_bounds)
+        cross = [(s, c, is_range) for s, c, is_range in refs if s != sheet]
+        for src in {s for s, c, is_range in cross}:
+            flow[(src, sheet)] = flow.get((src, sheet), 0) + 1
+        for src_sheet, src_cell, is_range in cross:
+            raw_refs.append((sheet, cell, src_sheet, src_cell))
+
+    precedent_cells, dependent_cells = {}, {}
+    for dst_sheet, dst_cell, src_sheet, src_cell in raw_refs:
+        if flow.get((src_sheet, dst_sheet), 0) < min_cells:
+            continue
+        precedent_cells.setdefault(dst_sheet, set()).add(dst_cell)
+        dependent_cells.setdefault(src_sheet, set()).add(src_cell)
+    return flow, precedent_cells, dependent_cells
+
+
+def export_trace_summary(nodes_info, combined_flow, output_path):
+    """Companion trace-data export, same spirit as the original tools'
+    Sheet Trace workbook: one row per sheet with stage/category, what
+    feeds it, what it feeds, and reference counts."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Lineage Trace"
+    headers = ["Sheet", "File", "Stage", "Category", "Fed By", "Fed Into", "Input Refs", "Output Refs"]
+    ws.append(headers)
+    for i in range(1, len(headers) + 1):
+        ws.cell(row=1, column=i).font = Font(bold=True)
+
+    for nid, info in sorted(nodes_info.items(), key=lambda kv: (kv[1]["stage"], kv[1]["sheet"])):
+        fed_by = sorted({src for (src, dst) in combined_flow if dst == nid})
+        fed_into = sorted({dst for (src, dst) in combined_flow if src == nid})
+        in_ct = sum(v for (src, dst), v in combined_flow.items() if dst == nid)
+        out_ct = sum(v for (src, dst), v in combined_flow.items() if src == nid)
+        ws.append([
+            info["sheet"], info["file"], info["stage"], info["category"],
+            ", ".join(nodes_info[s]["sheet"] for s in fed_by if s in nodes_info) or "(none)",
+            ", ".join(nodes_info[s]["sheet"] for s in fed_into if s in nodes_info) or "(none)",
+            in_ct, out_ct,
+        ])
+    widths = [22, 22, 12, 26, 30, 30, 10, 10]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+    wb.save(output_path)
+
+
+# ---------------------------------------------------------------
+# Excel COM automation - identical approach to the original
+# sheet_tree_server.py, adapted to take an explicit workbook path per
+# call since a lineage graph here can span multiple workbooks.
+# ---------------------------------------------------------------
+
+_last_auto_unhidden = {"path": None, "sheet": None}
+
+
+def open_sheet_in_excel(workbook_path, sheet_name, precedent_cells=None, dependent_cells=None):
+    import win32com.client as win32
+    import pywintypes
+    import win32gui
+    import win32process
+    import win32api
+    import win32con
+
+    def com_retry(func, attempts=6, delay=0.4, required=True):
+        last_exc = None
+        for _ in range(attempts):
+            try:
+                return func()
+            except Exception as e:
+                last_exc = e
+                time.sleep(delay)
+        if required:
+            raise last_exc
+        return None
+
+    def norm(p):
+        return os.path.normcase(os.path.normpath(p))
+
+    abs_path = os.path.abspath(workbook_path)
+    target_norm = norm(abs_path)
+    target_base = os.path.basename(abs_path).lower()
+
+    excel, wb = None, None
+    try:
+        excel = win32.GetActiveObject("Excel.Application")
+    except pywintypes.com_error:
+        excel = None
+
+    if excel is not None:
+        for book in excel.Workbooks:
+            try:
+                if norm(book.FullName) == target_norm:
+                    wb = book
+                    break
+            except Exception:
+                continue
+        if wb is None:
+            for book in excel.Workbooks:
+                try:
+                    if book.Name.lower() == target_base:
+                        wb = book
+                        break
+                except Exception:
+                    continue
+
+    if excel is None:
+        excel = win32.Dispatch("Excel.Application")
+
+    com_retry(lambda: setattr(excel, "Visible", True))
+    com_retry(lambda: setattr(excel, "DisplayAlerts", False), required=False)
+    com_retry(lambda: setattr(excel, "AskToUpdateLinks", False), required=False)
+
+    if wb is None:
+        wb = com_retry(lambda: excel.Workbooks.Open(abs_path, 0))
+
+    def exit_protected_view():
+        if wb.ProtectedViewWindow is not None:
+            return wb.ProtectedViewWindow.Edit()
+        return wb
+    new_wb = com_retry(exit_protected_view, required=False)
+    if new_wb is not None:
+        wb = new_wb
+
+    com_retry(lambda: setattr(excel, "DisplayAlerts", False), required=False)
+    com_retry(lambda: wb.Activate())
+
+    global _last_auto_unhidden
+    if (_last_auto_unhidden["path"] == target_norm
+            and _last_auto_unhidden["sheet"] is not None
+            and _last_auto_unhidden["sheet"] != sheet_name):
+        com_retry(lambda: setattr(wb.Sheets(_last_auto_unhidden["sheet"]), "Visible", 0), required=False)
+        _last_auto_unhidden["sheet"] = None
+
+    sht = com_retry(lambda: wb.Sheets(sheet_name))
+    was_hidden = com_retry(lambda: sht.Visible != -1, required=False)
+    if was_hidden:
+        com_retry(lambda: setattr(sht, "Visible", -1), required=False)
+    com_retry(lambda: sht.Activate())
+    if was_hidden:
+        _last_auto_unhidden["path"] = target_norm
+        _last_auto_unhidden["sheet"] = sheet_name
+
+    MAX_ARROWS_PER_TYPE = 300
+
+    def draw_arrows(addresses, method_name):
+        addresses = list(addresses)
+        truncated = len(addresses) > MAX_ARROWS_PER_TYPE
+        if truncated:
+            addresses = addresses[:MAX_ARROWS_PER_TYPE]
+        for addr in addresses:
+            com_retry(lambda addr=addr: getattr(sht.Range(addr), method_name)(), required=False)
+        return truncated
+
+    com_retry(lambda: setattr(excel, "ScreenUpdating", False), required=False)
+    try:
+        com_retry(lambda: sht.ClearArrows(), required=False)
+        precedents_truncated = draw_arrows(precedent_cells, "ShowPrecedents") if precedent_cells else False
+        dependents_truncated = draw_arrows(dependent_cells, "ShowDependents") if dependent_cells else False
+    finally:
+        com_retry(lambda: setattr(excel, "ScreenUpdating", True), required=False)
+
+    try:
+        hwnd = wb.Windows(1).Hwnd
+        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+        win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+        fg_hwnd = win32gui.GetForegroundWindow()
+        fg_thread = win32process.GetWindowThreadProcessId(fg_hwnd)[0]
+        target_thread = win32process.GetWindowThreadProcessId(hwnd)[0]
+        current_thread = win32api.GetCurrentThreadId()
+        win32process.AttachThreadInput(fg_thread, current_thread, True)
+        win32process.AttachThreadInput(target_thread, current_thread, True)
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+        finally:
+            win32process.AttachThreadInput(fg_thread, current_thread, False)
+            win32process.AttachThreadInput(target_thread, current_thread, False)
+    except Exception:
+        pass
+
+    return {"precedents_truncated": precedents_truncated, "dependents_truncated": dependents_truncated}
+
+
+# ---------------------------------------------------------------
+# HTML / vis-network page - same interaction model as the original
+# sheet_tree_server.py (search, right-click hide/show, show-all/hide-
+# all/undo panel), recolored for stage + anomaly styling.
+# ---------------------------------------------------------------
+
+HTML_TEMPLATE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  html, body { margin:0; padding:0; background:#111111; }
+  #tree { width:100vw; height:100vh; }
+  #hint {
+    position:fixed; top:10px; left:10px; color:white; font-family:sans-serif;
+    font-size:13px; background:rgba(0,0,0,0.6); padding:8px 14px; border-radius:6px;
+    max-width: 520px; z-index: 1000;
+  }
+  #viewToggle { margin-bottom:8px; }
+  .viewBtn {
+    padding: 5px 12px; border-radius: 4px; border: 1px solid #555; background: #222;
+    color: #ccc; font-size: 13px; cursor: pointer; margin-right: 6px;
+  }
+  .viewBtn.active { background: #3a3a3a; color: #fff; border-color: #999; font-weight: bold; }
+  #searchRow { margin-bottom:6px; }
+  #searchBox { width: 220px; padding: 4px 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #fff; font-size: 13px; }
+  #searchGoBtn { padding: 4px 10px; border-radius: 4px; border: 1px solid #555; background: #333; color: #fff; font-size: 13px; cursor: pointer; margin-left: 4px; }
+  #sheetPanel {
+    position:fixed; top:10px; right:10px; color:white; font-family:sans-serif;
+    font-size:13px; background:rgba(0,0,0,0.65); padding:8px 14px; border-radius:6px;
+    max-width: 280px; max-height: 85vh; z-index: 1000; overflow-y:auto;
+  }
+  #sheetPanelHeader { font-weight:bold; margin-bottom:6px; }
+  #sheetCheckboxes label { display:block; margin:2px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .swatch { display:inline-block; width:11px; height:11px; border-radius:2px; margin-right:4px; vertical-align:middle; }
+  .line { display:inline-block; width:18px; height:2px; margin-right:4px; vertical-align:middle; }
+  .legendBlock { display:none; }
+  .legendBlock.active { display:block; }
+</style>
+</head>
+<body>
+<div id="hint">
+  <div id="viewToggle">
+    <button class="viewBtn active" id="btnClean">Clean Flow (classified only)</button>
+    <button class="viewBtn" id="btnFull">Full Flow (with anomalies)</button>
+  </div>
+  <div id="searchRow">
+    <input type="text" id="searchBox" list="sheetList" placeholder="Search sheet name...">
+    <button id="searchGoBtn">Find</button>
+    <datalist id="sheetList"></datalist>
+  </div>
+
+  <div class="legendBlock active" id="legendClean">
+    <span class="swatch" style="background:#2ecc71;"></span>Input&nbsp;
+    <span class="swatch" style="background:#2a9d8f;"></span>Process&nbsp;
+    <span class="swatch" style="background:#f39c12;"></span>Output<br>
+    <span class="line" style="background:#888888;"></span>Formula link between classified sheets.
+    Only sheets that are both classified and connected are shown.
+  </div>
+  <div class="legendBlock" id="legendFull">
+    <span class="swatch" style="background:__FULL_CLASSIFIED_COLOR__;"></span>Classified&nbsp;
+    <span class="swatch" style="background:__FULL_UNCLASSIFIED_COLOR__;"></span>Not yet classified<br>
+    <span class="line" style="background:#888888;"></span>Normal link&nbsp;
+    <span class="line" style="border-bottom:2px dashed #8e6bbf;"></span>Touches an unclassified sheet&nbsp;
+    <span class="line" style="border-bottom:3px dashed #e63946;"></span><b style="color:#e63946;">Anomaly (rule broken)</b>
+  </div>
+
+  Click a sheet box to switch to it in Excel (draws Trace Precedents/Dependents arrows). Right-click to hide/show it.<br>
+  <label style="margin-right:12px;"><input type="checkbox" id="showPrecedents" checked> Precedent arrows</label>
+  <label><input type="checkbox" id="showDependents" checked> Dependent arrows</label>
+  <br><span id="status" style="opacity:0.8;"></span>
+</div>
+<div id="sheetPanel">
+  <div id="sheetPanelHeader">
+    Sheets <span id="togglePanelBtn" style="cursor:pointer; opacity:0.7;">[hide list]</span><br>
+    <span id="showAllBtn" style="cursor:pointer; text-decoration:underline; margin-right:10px;">Show all</span>
+    <span id="hideAllBtn" style="cursor:pointer; text-decoration:underline; margin-right:10px;">Hide all</span>
+    <span id="undoBtn" style="cursor:pointer; text-decoration:underline;">Undo</span>
+  </div>
+  <div id="sheetCheckboxes"></div>
+</div>
+<div id="tree"></div>
+<script type="text/javascript">
+  var CLEAN_NODES = __CLEAN_NODES__;
+  var CLEAN_EDGES = __CLEAN_EDGES__;
+  var FULL_NODES = __FULL_NODES__;
+  var FULL_EDGES = __FULL_EDGES__;
+
+  var nodes = new vis.DataSet([]);
+  var edges = new vis.DataSet([]);
+  var container = document.getElementById('tree');
+  var options = {
+    layout: { hierarchical: { enabled: true, direction: "LR", sortMethod: "directed",
+      levelSeparation: 220, nodeSpacing: 130, treeSpacing: 160 } },
+    physics: { hierarchicalRepulsion: { nodeDistance: 150 }, solver: "hierarchicalRepulsion" },
+    edges: { smooth: { type: "cubicBezier", forceDirection: "horizontal" },
+      arrows: { to: { enabled: true } }, font: { color: "#ffffff" } },
+    nodes: { font: { color: "#ffffff", size: 13 } }
+  };
+  var network = new vis.Network(container, { nodes: nodes, edges: edges }, options);
+  var currentView = "clean";
+  var undoStack = [];
+
+  function loadView(view) {
+    currentView = view;
+    undoStack = [];
+    nodes.clear(); edges.clear();
+    var nData = view === "clean" ? CLEAN_NODES : FULL_NODES;
+    var eData = view === "clean" ? CLEAN_EDGES : FULL_EDGES;
+    nodes.add(nData);
+    edges.add(eData);
+    network.setOptions({ physics: true });
+    network.once("stabilizationIterationsDone", function () { network.setOptions({ physics: false }); });
+    document.getElementById('btnClean').classList.toggle('active', view === "clean");
+    document.getElementById('btnFull').classList.toggle('active', view === "full");
+    document.getElementById('legendClean').classList.toggle('active', view === "clean");
+    document.getElementById('legendFull').classList.toggle('active', view === "full");
+    buildPanel();
+    buildSearchList();
+    document.getElementById('status').innerText = "";
+  }
+
+  document.getElementById('btnClean').addEventListener('click', function () { loadView('clean'); });
+  document.getElementById('btnFull').addEventListener('click', function () { loadView('full'); });
+
+  network.on("click", function (params) {
+    if (params.nodes.length > 0) {
+      var id = params.nodes[0];
+      var statusEl = document.getElementById('status');
+      var showPre = document.getElementById('showPrecedents').checked;
+      var showDep = document.getElementById('showDependents').checked;
+      statusEl.innerText = "Opening: " + id + " ...";
+      fetch('/open?id=' + encodeURIComponent(id) + '&precedents=' + showPre + '&dependents=' + showDep)
+        .then(function(r) { return r.text(); })
+        .then(function(text) {
+          statusEl.innerText = text.indexOf("ok") === 0
+            ? "Opened: " + id + (text.length > 2 ? " - " + text.slice(4, -1) : "")
+            : "Error opening " + id + ": " + text;
+        })
+        .catch(function(err) { statusEl.innerText = "Could not reach local server: " + err; });
+    }
+  });
+
+  network.on("oncontext", function (params) {
+    params.event.preventDefault();
+    var nodeId = network.getNodeAt(params.pointer.DOM);
+    if (nodeId) {
+      var node = nodes.get(nodeId);
+      applyChanges([{ id: nodeId, hidden: !node.hidden }]);
+    }
+  });
+
+  function setHidden(id, hidden) {
+    nodes.update({ id: id, hidden: hidden });
+    var cb = document.querySelector('input[data-sheet-id="' + id + '"]');
+    if (cb) cb.checked = !hidden;
+  }
+  function applyChanges(changes) {
+    var undoEntry = [];
+    changes.forEach(function(change) {
+      var node = nodes.get(change.id);
+      if (!node) return;
+      undoEntry.push({ id: change.id, prevHidden: !!node.hidden });
+      setHidden(change.id, change.hidden);
+    });
+    undoStack.push(undoEntry);
+  }
+
+  function buildPanel() {
+    var checkboxContainer = document.getElementById('sheetCheckboxes');
+    checkboxContainer.innerHTML = '';
+    var ids = nodes.getIds().slice().sort();
+    ids.forEach(function(id) {
+      var node = nodes.get(id);
+      var label = document.createElement('label');
+      var cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = true; cb.dataset.sheetId = id;
+      cb.addEventListener('change', function() { applyChanges([{ id: id, hidden: !cb.checked }]); });
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(' ' + node.label.replace(/\\n/g, ' ')));
+      checkboxContainer.appendChild(label);
+    });
+  }
+
+  document.getElementById('showAllBtn').addEventListener('click', function() {
+    applyChanges(nodes.getIds().map(function(id) { return { id: id, hidden: false }; }));
+  });
+  document.getElementById('hideAllBtn').addEventListener('click', function() {
+    applyChanges(nodes.getIds().map(function(id) { return { id: id, hidden: true }; }));
+  });
+  document.getElementById('undoBtn').addEventListener('click', function() {
+    var entry = undoStack.pop();
+    if (!entry) return;
+    entry.forEach(function(change) { setHidden(change.id, change.prevHidden); });
+  });
+  document.getElementById('togglePanelBtn').addEventListener('click', function() {
+    var checkboxContainer = document.getElementById('sheetCheckboxes');
+    var listVisible = checkboxContainer.style.display !== 'none';
+    checkboxContainer.style.display = listVisible ? 'none' : 'block';
+    ['showAllBtn','hideAllBtn','undoBtn'].forEach(function(bid) {
+      document.getElementById(bid).style.display = listVisible ? 'none' : 'inline';
+    });
+    this.innerText = listVisible ? '[show list]' : '[hide list]';
+  });
+
+  function buildSearchList() {
+    var sheetListEl = document.getElementById('sheetList');
+    sheetListEl.innerHTML = '';
+    nodes.getIds().slice().sort().forEach(function(id) {
+      var opt = document.createElement('option');
+      opt.value = nodes.get(id).label.replace(/\\n/g, ' ');
+      sheetListEl.appendChild(opt);
+    });
+  }
+
+  var highlightState = null;
+  function clearHighlight() {
+    if (highlightState) {
+      nodes.update({ id: highlightState.id, color: highlightState.originalColor, borderWidth: highlightState.originalBorderWidth });
+      highlightState = null;
+    }
+  }
+  function highlightSheet(rawName) {
+    clearHighlight();
+    var name = (rawName || '').trim();
+    if (!name) return false;
+    var lower = name.toLowerCase();
+    var ids = nodes.getIds();
+    var match = ids.find(function(id) { return nodes.get(id).label.replace(/\\n/g,' ').toLowerCase() === lower; });
+    if (!match) {
+      match = ids.find(function(id) { return nodes.get(id).label.replace(/\\n/g,' ').toLowerCase().indexOf(lower) !== -1; });
+    }
+    if (!match) return false;
+    setHidden(match, false);
+    var node = nodes.get(match);
+    var baseColor = (typeof node.color === 'string') ? node.color : (node.color && node.color.background) || '#2a9d8f';
+    highlightState = { id: match, originalColor: node.color, originalBorderWidth: node.borderWidth || 1 };
+    nodes.update({ id: match, borderWidth: 6, color: { background: baseColor, border: '#ff0055', highlight: { background: baseColor, border: '#ff0055' } } });
+    network.selectNodes([match]);
+    network.focus(match, { scale: 1.3, animation: { duration: 500, easingFunction: 'easeInOutQuad' } });
+    return match;
+  }
+  function runSearch() {
+    var val = document.getElementById('searchBox').value;
+    var statusEl = document.getElementById('status');
+    var found = highlightSheet(val);
+    statusEl.innerText = found ? ('Found: ' + val) : ('No sheet matching "' + val + '" in this view');
+  }
+  document.getElementById('searchGoBtn').addEventListener('click', runSearch);
+  document.getElementById('searchBox').addEventListener('keydown', function(e) { if (e.key === 'Enter') runSearch(); });
+  document.getElementById('searchBox').addEventListener('input', function(e) { if (e.target.value.trim() === '') clearHighlight(); });
+
+  window.addEventListener('resize', function() { network.redraw(); });
+
+  loadView('clean');
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    html_content = ""
+    node_file_path = {}      # node id -> workbook path
+    node_sheet_name = {}     # node id -> real sheet name (as it exists in that workbook)
+    precedent_cells = {}     # node id -> [cell addresses]
+    dependent_cells = {}     # node id -> [cell addresses]
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/lineage_flow.html"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(Handler.html_content.encode("utf-8"))
+        elif parsed.path == "/open":
+            qs = parse_qs(parsed.query)
+            node = qs.get("id", [None])[0]
+            want_pre = qs.get("precedents", ["true"])[0].lower() == "true"
+            want_dep = qs.get("dependents", ["true"])[0].lower() == "true"
+            status = "ok"
+            try:
+                path = Handler.node_file_path.get(node)
+                sheet = Handler.node_sheet_name.get(node)
+                if not path or not sheet:
+                    raise RuntimeError("Unknown node")
+                pre = sorted(Handler.precedent_cells.get(node, [])) if want_pre else []
+                dep = sorted(Handler.dependent_cells.get(node, [])) if want_dep else []
+                result = open_sheet_in_excel(path, sheet, precedent_cells=pre, dependent_cells=dep)
+                notes = []
+                if result.get("precedents_truncated"):
+                    notes.append("precedents capped at 300")
+                if result.get("dependents_truncated"):
+                    notes.append("dependents capped at 300")
+                if notes:
+                    status = "ok (" + ", ".join(notes) + ")"
+            except Exception as e:
+                status = str(e)
+                print(f"[!] Could not open node '{node}' in Excel: {e}")
+                import traceback
+                traceback.print_exc()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(status.encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python lineage_flow_visual.py <handoff.json> [min_cells]")
+        sys.exit(1)
+    handoff_path = sys.argv[1]
+    min_cells = DEFAULT_MIN_CELLS
+    if len(sys.argv) >= 3:
+        try:
+            min_cells = int(sys.argv[2])
+        except ValueError:
+            pass
+
+    with open(handoff_path, "r", encoding="utf-8") as f:
+        handoff = json.load(f)
+    files = handoff["files"]              # {filename: path}
+    classification = handoff.get("classification", {})  # {"file::sheet": {"stage":..,"category":..}}
+    multi_file = len(files) > 1
+
+    combined_flow = {}
+    node_info = {}  # node id -> {file, sheet, stage, category}
+    precedent_cells, dependent_cells = {}, {}
+    node_file_path, node_sheet_name = {}, {}
+
+    for fname, fpath in files.items():
+        formulas, sheet_names, sheet_bounds = load_formulas(fpath)
+        flow, prec, dep = build_flow_and_arrows(formulas, sheet_bounds, min_cells)
+        for sheet in sheet_names:
+            nid = f"{fname}::{sheet}"
+            cls = classification.get(nid, {})
+            node_info[nid] = {
+                "file": fname, "sheet": sheet,
+                "stage": cls.get("stage", UNCLASSIFIED),
+                "category": cls.get("category", UNCLASSIFIED),
+            }
+            node_file_path[nid] = fpath
+            node_sheet_name[nid] = sheet
+            if sheet in prec:
+                precedent_cells[nid] = prec[sheet]
+            if sheet in dep:
+                dependent_cells[nid] = dep[sheet]
+        for (src, dst), cnt in flow.items():
+            combined_flow[(f"{fname}::{src}", f"{fname}::{dst}")] = cnt
+
+    if not combined_flow:
+        print("No cross-sheet formula links found across the given file(s) - nothing to draw.")
+        return
+
+    def label_of(nid):
+        info = node_info[nid]
+        return f"{info['sheet']}\n({info['file']})" if multi_file else info["sheet"]
+
+    def build_node(nid, stage_colored):
+        info = node_info[nid]
+        stage = info["stage"]
+        if stage_colored:
+            bg = STAGE_COLOR.get(stage, STAGE_COLOR[UNCLASSIFIED])
+            border = "#ffffff"
+        else:
+            bg = FULL_CLASSIFIED_COLOR if stage != UNCLASSIFIED else FULL_UNCLASSIFIED_COLOR
+            border = "#ffffff" if stage != UNCLASSIFIED else "#666666"
+        return {
+            "id": nid, "label": label_of(nid), "shape": "box",
+            "level": STAGE_LEVEL.get(stage, 3),
+            "title": f"{label_of(nid)}\nStage: {stage}\nCategory: {info['category']}\nClick to switch to this sheet in Excel",
+            "color": {"background": bg, "border": border},
+            "borderWidth": 3 if stage != UNCLASSIFIED else 1,
+        }
+
+    # Sort every real flow link into exactly one of three buckets.
+    normal_edges, anomaly_edges, unclassified_edges = [], [], []
+    for (src, dst), cnt in combined_flow.items():
+        s_stage, d_stage = node_info[src]["stage"], node_info[dst]["stage"]
+        if s_stage == UNCLASSIFIED or d_stage == UNCLASSIFIED:
+            unclassified_edges.append((src, dst, cnt))
+        elif (s_stage, d_stage) in ALLOWED_STAGE_TRANSITIONS:
+            normal_edges.append((src, dst, cnt, s_stage, d_stage))
+        else:
+            anomaly_edges.append((src, dst, cnt, s_stage, d_stage))
+
+    # --- Clean Flow: classified sheets only, only the sheets that are
+    # actually connected to another classified sheet, only normal
+    # (rule-following) links - no unclassified touches, no anomalies,
+    # no dashed lines at all. ---
+    clean_ids = set()
+    for src, dst, cnt, ss, ds in normal_edges:
+        clean_ids.add(src)
+        clean_ids.add(dst)
+    clean_nodes_json = [build_node(nid, stage_colored=True) for nid in clean_ids]
+    clean_edges_json = [
+        {"from": src, "to": dst, "label": str(cnt), "color": "#888888",
+         "title": f"{cnt} formula cell(s) - {ss} -> {ds}"}
+        for src, dst, cnt, ss, ds in normal_edges
+    ]
+
+    # --- Full Flow: every sheet (classified in one color, unclassified
+    # in another), every link, with anomalies and unclassified-touching
+    # links called out. ---
+    full_nodes_json = [build_node(nid, stage_colored=False) for nid in node_info]
+    full_edges_json = []
+    for src, dst, cnt, ss, ds in normal_edges:
+        full_edges_json.append({"from": src, "to": dst, "label": str(cnt), "color": "#888888",
+                                 "title": f"{cnt} formula cell(s) - {ss} -> {ds}"})
+    for src, dst, cnt in unclassified_edges:
+        full_edges_json.append({"from": src, "to": dst, "label": str(cnt), "color": "#8e6bbf",
+                                 "dashes": [2, 2], "title": f"{cnt} formula cell(s) - touches an unclassified sheet"})
+    for src, dst, cnt, ss, ds in anomaly_edges:
+        full_edges_json.append({"from": src, "to": dst, "label": f"ANOMALY ({cnt})", "color": "#e63946",
+                                 "dashes": [6, 3], "width": 3,
+                                 "title": f"Rule violation: {ss} -> {ds} is not an allowed transition"})
+
+    html = (HTML_TEMPLATE
+            .replace("__CLEAN_NODES__", json.dumps(clean_nodes_json))
+            .replace("__CLEAN_EDGES__", json.dumps(clean_edges_json))
+            .replace("__FULL_NODES__", json.dumps(full_nodes_json))
+            .replace("__FULL_EDGES__", json.dumps(full_edges_json))
+            .replace("__FULL_CLASSIFIED_COLOR__", FULL_CLASSIFIED_COLOR)
+            .replace("__FULL_UNCLASSIFIED_COLOR__", FULL_UNCLASSIFIED_COLOR))
+
+    # Companion trace-data export, written next to the handoff file.
+    try:
+        out_dir = os.path.dirname(os.path.abspath(handoff_path))
+        trace_path = os.path.join(out_dir, "lineage_trace_data.xlsx")
+        export_trace_summary(node_info, combined_flow, trace_path)
+        print(f"Wrote lineage trace data to {trace_path}")
+    except Exception as e:
+        print(f"[!] Could not write trace data workbook: {e}")
+
+    Handler.html_content = html
+    Handler.node_file_path = node_file_path
+    Handler.node_sheet_name = node_sheet_name
+    Handler.precedent_cells = precedent_cells
+    Handler.dependent_cells = dependent_cells
+
+    server = HTTPServer(("127.0.0.1", PORT), Handler)
+    actual_port = server.server_address[1]
+    url = f"http://127.0.0.1:{actual_port}/"
+    print(f"\nServing lineage flow visual at {url}")
+    print("Leave this window open while you use it - Ctrl+C here to stop.")
+    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()
